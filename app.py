@@ -1,20 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v6.3 (FULL FILE, RTL, Mobile/Tablet friendly)
+Uzeb Sales Targets — v6.4 (FULL FILE, RTL, Mobile/Tablet friendly)
 
-What you get:
-1) Upload Excel → choose Agent.
-2) סעיף 2 "דוח מסכם — דוח יעדים לסוכן" is NOT shown as a table on screen.
-   It is available ONLY as an Excel download button.
-   Excel includes: שם לקוח | מכירות 2025 | יעד 2026 | תוספת בכסף | תוספת באחוזים + שורת סה"כ בתחתית.
-3) Customers selector = multiselect (default NONE).
-   - None selected → right side shows ALL agent scope (combined classes + KPI).
-   - Single customer → editable class targets + KPI shows customer share% next to 2026 target.
-   - Multiple customers → read-only scope (selected customers).
-4) Single customer export (styled) — green highlight only where "תוספת יעד (כמות)" entered.
-
-Run:
-  streamlit run app.py
+Includes:
+- Upload Excel → choose Agent.
+- Two Agent-level Excel downloads:
+  (A) דוח מסכם — יעד 2026 (Excel בלבד): שם לקוח | מכירות בכסף 2025 | יעד מכירות 2026 | תוספת בכסף | תוספת מכירות באחוזים + סה"כ
+  (B) דוח מכירות סוכן 2025→2026 (Excel): שם לקוח | מכירות 2025 | מכירות 2026 | הפרש | שינוי באחוזים + סה"כ
+- Customers multiselect (default NONE):
+  - None selected → show ALL agent scope (combined classes + KPI).
+  - Single customer → editable targets per class + KPI shows customer share%.
+  - Multiple customers → read-only combined scope.
+- Single customer Excel export (styled): green only where delta qty entered.
 """
 
 import math
@@ -287,7 +284,7 @@ def kpi_block(display_sales_2026: float, base_sales_2025: float, added_money: fl
         f"""
         <div class="kpi-grid">
             <div class="kpi">
-                <div class="label">יעד 2026 (₪)</div>
+                <div class="label">מכירות/יעד 2026 (₪)</div>
                 <div class="value">{fmt_money(display_sales_2026)}</div>
                 {share_line}
             </div>
@@ -297,12 +294,12 @@ def kpi_block(display_sales_2026: float, base_sales_2025: float, added_money: fl
                 <div class="sub">סכום נטו מהקובץ</div>
             </div>
             <div class="kpi">
-                <div class="label">תוספת בכסף (₪)</div>
+                <div class="label">הפרש (₪)</div>
                 <div class="value">{fmt_money(added_money)}</div>
                 <div class="sub">2026 - 2025</div>
             </div>
             <div class="kpi">
-                <div class="label">תוספת מכירות באחוזים (%)</div>
+                <div class="label">שינוי (%)</div>
                 <div class="value">{fmt_pct(growth_pct)}</div>
                 <div class="sub">(2026/2025)*100 - 100</div>
             </div>
@@ -384,7 +381,7 @@ def build_class_view(qty_dict: dict, money_dict: dict, agent: str, account: str,
 
 
 # =========================
-# Agent Summary (df + Excel) — download only (no on-screen table)
+# Agent reports (dataframes)
 # =========================
 def build_agent_summary_report(agent_raw: str, agent_df: pd.DataFrame, delta_qty_dict: dict, delta_money_dict: dict) -> pd.DataFrame:
     customers = agent_df[COL_ACCOUNT].dropna().astype(str).unique().tolist()
@@ -435,6 +432,60 @@ def build_agent_summary_report(agent_raw: str, agent_df: pd.DataFrame, delta_qty
     return pd.concat([df, df_total], ignore_index=True)
 
 
+def build_agent_sales_report_2025_2026(agent_raw: str, agent_df: pd.DataFrame, delta_qty_dict: dict, delta_money_dict: dict) -> pd.DataFrame:
+    customers = agent_df[COL_ACCOUNT].dropna().astype(str).unique().tolist()
+    rows = []
+
+    for acc in customers:
+        df_c = agent_df[agent_df[COL_ACCOUNT].astype(str) == str(acc)].copy()
+        if df_c.empty:
+            continue
+
+        class_view = build_class_view(delta_qty_dict, delta_money_dict, agent_raw, str(acc), df_c)
+        s2025 = float(pd.to_numeric(class_view["מכירות_בכסף"], errors="coerce").fillna(0.0).sum())
+        add_money = float(pd.to_numeric(class_view["תוספת_יעד_כסף"], errors="coerce").fillna(0.0).sum())
+        s2026 = s2025 + add_money
+        diff = s2026 - s2025
+        pct = (safe_div(s2026, s2025) * 100 - 100) if s2025 > 0 else math.nan
+
+        rows.append(
+            {
+                "שם לקוח": str(acc),
+                "מכירות 2025": s2025,
+                "מכירות 2026": s2026,
+                "הפרש בין 2025 ל 2026": diff,
+                "שינוי באחוזים": pct,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df = df.sort_values("מכירות 2025", ascending=False).reset_index(drop=True)
+
+    t2025 = float(pd.to_numeric(df["מכירות 2025"], errors="coerce").fillna(0.0).sum())
+    t2026 = float(pd.to_numeric(df["מכירות 2026"], errors="coerce").fillna(0.0).sum())
+    tdiff = t2026 - t2025
+    tpct = (safe_div(t2026, t2025) * 100 - 100) if t2025 > 0 else math.nan
+
+    df_total = pd.DataFrame(
+        [
+            {
+                "שם לקוח": "סה״כ",
+                "מכירות 2025": t2025,
+                "מכירות 2026": t2026,
+                "הפרש בין 2025 ל 2026": tdiff,
+                "שינוי באחוזים": tpct,
+            }
+        ]
+    )
+    return pd.concat([df, df_total], ignore_index=True)
+
+
+# =========================
+# Agent reports (Excel writers)
+# =========================
 def make_agent_summary_excel(agent_display: str, df_summary: pd.DataFrame) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -478,8 +529,7 @@ def make_agent_summary_excel(agent_display: str, df_summary: pd.DataFrame) -> by
         cell.alignment = align_center
         cell.border = border_all
 
-    data_start = start_row + 1
-    for i, row in enumerate(df.itertuples(index=False), start=data_start):
+    for i, row in enumerate(df.itertuples(index=False), start=start_row + 1):
         is_total = (str(row[0]).strip() == "סה״כ")
         for j, value in enumerate(row, start=1):
             c = ws.cell(row=i, column=j, value=value)
@@ -496,7 +546,67 @@ def make_agent_summary_excel(agent_display: str, df_summary: pd.DataFrame) -> by
     widths = {1: 34, 2: 18, 3: 18, 4: 16, 5: 18}
     for j, w in widths.items():
         ws.column_dimensions[get_column_letter(j)].width = w
+    ws.freeze_panes = ws["A4"]
 
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+
+def make_agent_sales_excel(agent_display: str, df_report: pd.DataFrame) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "מכירות סוכן"
+    ws.sheet_view.rightToLeft = True
+
+    font_title = Font(bold=True, size=13)
+    font_bold = Font(bold=True)
+    align_center = Alignment(horizontal="center", vertical="center")
+    align_right = Alignment(horizontal="right", vertical="center")
+    thin = Side(style="thin", color="D0D0D0")
+    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
+    fill_header = PatternFill("solid", fgColor="F3F4F6")
+    fill_total = PatternFill("solid", fgColor="E5E7EB")
+
+    ws.merge_cells("A1:E1")
+    ws["A1"].value = f"דוח מכירות סוכן (2025→2026): {agent_display}"
+    ws["A1"].font = font_title
+    ws["A1"].alignment = align_right
+    ws.row_dimensions[1].height = 22
+
+    start_row = 3
+    cols = ["שם לקוח", "מכירות 2025", "מכירות 2026", "הפרש בין 2025 ל 2026", "שינוי באחוזים"]
+
+    df = df_report.copy()
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    df = df[cols]
+
+    for j, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=start_row, column=j, value=col_name)
+        cell.font = font_bold
+        cell.fill = fill_header
+        cell.alignment = align_center
+        cell.border = border_all
+
+    for i, row in enumerate(df.itertuples(index=False), start=start_row + 1):
+        is_total = (str(row[0]).strip() == "סה״כ")
+        for j, value in enumerate(row, start=1):
+            c = ws.cell(row=i, column=j, value=value)
+            c.border = border_all
+            c.alignment = align_right if j == 1 else align_center
+            if j in (2, 3, 4):
+                c.number_format = "#,##0.00"
+            elif j == 5:
+                c.number_format = "0.0"
+            if is_total:
+                c.font = font_bold
+                c.fill = fill_total
+
+    widths = {1: 34, 2: 18, 3: 18, 4: 22, 5: 16}
+    for j, w in widths.items():
+        ws.column_dimensions[get_column_letter(j)].width = w
     ws.freeze_panes = ws["A4"]
 
     bio = BytesIO()
@@ -563,8 +673,7 @@ def make_styled_export_excel(agent_display: str, account_display: str, df_classe
         cell.alignment = align_center
         cell.border = border_all
 
-    data_start = start_row + 1
-    for i, row in enumerate(df.itertuples(index=False), start=data_start):
+    for i, row in enumerate(df.itertuples(index=False), start=start_row + 1):
         for j, value in enumerate(row, start=start_col):
             c = ws.cell(row=i, column=j, value=value)
             c.alignment = align_right if j == start_col else align_center
@@ -582,7 +691,6 @@ def make_styled_export_excel(agent_display: str, account_display: str, df_classe
         dm_col_idx = cols.index("תוספת_יעד_כסף") + start_col
         dq_cell = ws.cell(row=i, column=dq_col_idx)
         dm_cell = ws.cell(row=i, column=dm_col_idx)
-
         try:
             dq_val = float(dq_cell.value) if dq_cell.value is not None else 0.0
             if abs(dq_val) > 0:
@@ -609,7 +717,7 @@ st.markdown(
     """
 <div class="card">
   <h2>📊 Uzeb — ניהול יעדי מכירות</h2>
-  <p>העלה קובץ → בחר סוכן → (אופציונלי) בחר לקוחות → צפה/ערוך יעדים → הורד דוחות.</p>
+  <p>העלה קובץ → בחר סוכן → הורד דוחות סוכן → (אופציונלי) בחר לקוחות → צפה/ערוך.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -620,7 +728,7 @@ st.markdown(
 # =========================
 with st.sidebar:
     st.markdown("### שלבים")
-    st.caption("1) העלה קובץ  →  2) בחר סוכן  →  3) הורד דוח מסכם  →  4) בחר לקוחות (אופציונלי)")
+    st.caption("1) העלה קובץ  →  2) בחר סוכן  →  3) דוחות סוכן  →  4) לקוחות (אופציונלי)")
 
     rerun_clicked = st.button("רענון", use_container_width=True)
     st.markdown(
@@ -688,29 +796,38 @@ agent_df = sales[sales[COL_AGENT].astype(str) == str(selected_agent)].copy()
 agent_total_money_2025 = float(agent_df[COL_NET].sum())
 
 # =========================
-# סעיף 2: דוח מסכם — Download ONLY (no table on screen)
+# Agent-level Excel reports (download buttons)
 # =========================
-summary_df = build_agent_summary_report(
-    agent_raw=str(selected_agent),
-    agent_df=agent_df,
-    delta_qty_dict=delta_qty_dict,
-    delta_money_dict=delta_money_dict,
-)
+summary_df = build_agent_summary_report(str(selected_agent), agent_df, delta_qty_dict, delta_money_dict)
+sales_df = build_agent_sales_report_2025_2026(str(selected_agent), agent_df, delta_qty_dict, delta_money_dict)
 
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown(f"### 2) דוח מסכם — דוח יעדים לסוכן: {agent_label(selected_agent)}")
-st.caption("הדוח זמין רק להורדה כ-Excel. כולל שורת סה״כ בתחתית.")
+st.markdown(f"### 2) דוחות סוכן (Excel) — {agent_label(selected_agent)}")
 
-summary_filename = f"uzeb_{safe_filename(str(selected_agent))}__agent_summary__2026.xlsx"
-summary_xls = make_agent_summary_excel(agent_label(selected_agent), summary_df)
+c1, c2 = st.columns([1, 1], gap="small")
 
-st.download_button(
-    "⬇️ הורד דוח מסכם (Excel)",
-    data=summary_xls,
-    file_name=summary_filename,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
+with c1:
+    st.caption("דוח מסכם (יעד 2026): 2025 | 2026 יעד | תוספת | %")
+    summary_filename = f"uzeb_{safe_filename(str(selected_agent))}__agent_summary__2026.xlsx"
+    st.download_button(
+        "⬇️ הורד דוח מסכם (Excel)",
+        data=make_agent_summary_excel(agent_label(selected_agent), summary_df),
+        file_name=summary_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+with c2:
+    st.caption("דוח מכירות סוכן: 2025 | 2026 | הפרש | שינוי %")
+    sales_filename = f"uzeb_{safe_filename(str(selected_agent))}__agent_sales_2025_2026.xlsx"
+    st.download_button(
+        "⬇️ הורד דוח מכירות סוכן (Excel)",
+        data=make_agent_sales_excel(agent_label(selected_agent), sales_df),
+        file_name=sales_filename,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
@@ -726,7 +843,6 @@ cust_table = (
 cust_table["נתח_מכירות_מהסוכן (%)"] = cust_table["סהכ_כסף"].apply(
     lambda x: safe_div(float(x), agent_total_money_2025) * 100 if agent_total_money_2025 > 0 else math.nan
 )
-
 customer_options = cust_table[COL_ACCOUNT].astype(str).tolist()
 
 # =========================
@@ -741,7 +857,7 @@ left, right = st.columns([1, 2], gap="large")
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### 3) בחירת לקוחות (אופציונלי)")
-    st.caption("ברירת מחדל: לא נבחר לקוח → תצוגה מלאה לסוכן. לקוח יחיד → עריכה. מספר לקוחות → תצוגה מסוננת לקריאה בלבד.")
+    st.caption("ברירת מחדל: לא נבחר לקוח → תצוגה מלאה לסוכן. לקוח יחיד → עריכה. מספר לקוחות → תצוגה מסוננת.")
 
     selected_customers = st.multiselect(
         "לקוחות (מסודר לפי מכירות)",
@@ -891,8 +1007,8 @@ with right:
                     "מחיר_ממוצע": st.column_config.NumberColumn("מחיר ממוצע", disabled=True, format="%.2f"),
                     "תוספת_יעד_כמות": st.column_config.NumberColumn("תוספת יעד (כמות)", step=1.0, format="%.2f"),
                     "תוספת_יעד_כסף": st.column_config.NumberColumn("תוספת יעד (₪) — מחושב", disabled=True, format="%.2f"),
-                    "יעד_בכסף": st.column_config.NumberColumn("יעד 2026 (₪) — מחושב", disabled=True, format="%.2f"),
-                    "יעד_בכמות": st.column_config.NumberColumn("יעד 2026 (כמות) — מחושב", disabled=True, format="%.2f"),
+                    "יעד_בכסף": st.column_config.NumberColumn("2026 (₪) — מחושב", disabled=True, format="%.2f"),
+                    "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות) — מחושב", disabled=True, format="%.2f"),
                     "פער_כמות": st.column_config.NumberColumn("פער כמות", disabled=True, format="%.2f"),
                     "% עמידה": st.column_config.NumberColumn("% עמידה", disabled=True, format="%.1f"),
                 },
