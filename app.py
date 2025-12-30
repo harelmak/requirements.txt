@@ -1,22 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.3.3 (FULL FILE, RTL, Mobile/Tablet friendly)
+Uzeb Sales Targets — v8.3.2 (FULL FILE, RTL, Mobile/Tablet friendly)
 
 Fixes for Streamlit Cloud / GitHub:
 1) No Hebrew identifiers in Python syntax (all internal computed names are ASCII).
 2) Fixed SQLite INSERT placeholders in db_upsert_company_processed (VALUES(1,?,?,?,?)).
 
-Performance (Section 1):
-- Store raw Excel bytes + preprocessed compressed DF bytes (no re-parse every rerun).
-- Self-heal if processed DF missing/outdated.
-
-New in v8.3.3 (per user request):
-- When NOT single customer (none selected OR multi selected OR ADMIN company-wide):
-  Show read-only table: sales by class (קודי מיון).
-  * For agent/user scope: shows sales + computed targets (read-only).
-  * For ADMIN company-wide: sales-only (no targets).
-
-Preserved:
+Features preserved:
+- Performance: store raw Excel bytes + preprocessed compressed DF bytes (no re-parse every rerun).
 - ADMIN password: 1511!!
 - ADMIN can create users + disable/delete users
 - Company-wide upload: agents see only their sales; ADMIN can view all + filter
@@ -724,75 +715,6 @@ def compute_scope_kpi(username: str, df_scope: pd.DataFrame, user_qty: dict, sel
     return s2025, s2026, diff, pct
 
 
-def build_scope_class_summary_table(
-    username: str,
-    df_scope: pd.DataFrame,
-    user_qty: dict,
-    selected_accounts: Optional[list[str]],
-    include_targets: bool,
-) -> pd.DataFrame:
-    """
-    טבלת סיכום לפי קוד מיון לטווח הנוכחי (סוכן/חברה/לקוחות מסוננים).
-    include_targets=False -> מכירות בלבד (למשל חברה מלאה).
-    include_targets=True  -> מציג גם תוספת יעד/יעד (אבל לא לעריכה כאן).
-    """
-    base = compute_classes(df_scope).copy()
-    base = base.rename(
-        columns={
-            COL_CLASS: "שם קוד מיון פריט",
-            "sales_money": "מכירות_בכסף",
-            "sales_qty": "מכירות_בכמות",
-            "avg_price": "מחיר_ממוצע",
-        }
-    )
-
-    if not include_targets:
-        return base[["שם קוד מיון פריט", "מכירות_בכסף", "מכירות_בכמות", "מחיר_ממוצע"]].copy()
-
-    scope_accounts = set(df_scope[COL_ACCOUNT].dropna().astype(str).tolist())
-    if selected_accounts is None:
-        allowed_accounts = scope_accounts
-    else:
-        allowed_accounts = set([str(x) for x in selected_accounts]) & scope_accounts
-
-    def agg_qty_delta(cls: str) -> float:
-        total = 0.0
-        for (u, acc, c), dq in user_qty.items():
-            if str(u) != str(username):
-                continue
-            if str(acc) not in allowed_accounts:
-                continue
-            if str(c) == str(cls):
-                total += float(dq or 0.0)
-        return total
-
-    base["תוספת_יעד_כמות"] = base["שם קוד מיון פריט"].astype(str).apply(agg_qty_delta)
-
-    def qty_to_money_row(r):
-        p = r["מחיר_ממוצע"]
-        dq = float(r["תוספת_יעד_כמות"] or 0.0)
-        if pd.isna(p) or float(p) == 0:
-            return 0.0
-        return dq * float(p)
-
-    base["תוספת_יעד_כסף"] = base.apply(qty_to_money_row, axis=1)
-    base["יעד_בכסף"] = base["מכירות_בכסף"] + base["תוספת_יעד_כסף"]
-    base["יעד_בכמות"] = base["מכירות_בכמות"] + base["תוספת_יעד_כמות"]
-
-    return base[
-        [
-            "שם קוד מיון פריט",
-            "מכירות_בכסף",
-            "מכירות_בכמות",
-            "מחיר_ממוצע",
-            "תוספת_יעד_כסף",
-            "תוספת_יעד_כמות",
-            "יעד_בכסף",
-            "יעד_בכמות",
-        ]
-    ].copy()
-
-
 # =========================
 # Report DF + Excel
 # =========================
@@ -921,6 +843,7 @@ def get_company_sales_df(con_) -> pd.DataFrame:
     if proc is not None and str(proc["source_uploaded_at"]) == str(company["uploaded_at"]):
         return load_company_sales_df_cached(proc["source_uploaded_at"], proc["df_gz_bytes"])
 
+    # Self-heal: preprocess once and store
     df_raw = read_sales_excel_bytes(company["file_bytes"])
     df_norm = normalize_sales_strict(df_raw)
     db_upsert_company_processed(con_, company["uploaded_at"], df_norm)
@@ -1329,7 +1252,6 @@ with right:
     selected_customers = [str(x) for x in st.session_state.get(sel_key, [])]
     none_selected = len(selected_customers) == 0
     single = len(selected_customers) == 1
-    multi = len(selected_customers) > 1
 
     if none_selected:
         df_scope = scope_df.copy()
@@ -1357,7 +1279,6 @@ with right:
     st.caption(scope_subtitle)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # KPI
     if IS_ADMIN and admin_company_wide:
         s2025 = float(pd.to_numeric(df_scope[COL_NET], errors="coerce").fillna(0.0).sum())
         s2026 = s2025
@@ -1368,58 +1289,6 @@ with right:
         s2025, s2026, diff, pct = compute_scope_kpi(context_username, df_scope, user_qty, selected_accounts_for_scope)
         kpi_block(s2026, s2025, diff, pct, share_pct if single else None, title_2026="מכירות/יעד 2026 (₪)")
 
-    # NEW: Class summary when NOT single customer (read-only)
-    if not single:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### פירוט מכירות לפי קודי מיון (קריאה בלבד)")
-        st.caption("מוצג לפי הטווח שנבחר: כל הסוכן / לקוחות מסוננים / חברה מלאה. אין עריכת יעדים במצב זה.")
-
-        if IS_ADMIN and admin_company_wide:
-            cls_tbl = build_scope_class_summary_table(
-                username=context_username,
-                df_scope=df_scope,
-                user_qty=user_qty,
-                selected_accounts=selected_accounts_for_scope,
-                include_targets=False,  # חברה מלאה = מכירות בלבד
-            )
-            st.dataframe(
-                cls_tbl,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון"),
-                    "מכירות_בכסף": st.column_config.NumberColumn("מכירות 2025 (₪)", format="%.2f"),
-                    "מכירות_בכמות": st.column_config.NumberColumn("כמות", format="%.2f"),
-                    "מחיר_ממוצע": st.column_config.NumberColumn("מחיר ממוצע", format="%.2f"),
-                },
-            )
-        else:
-            cls_tbl = build_scope_class_summary_table(
-                username=context_username,
-                df_scope=df_scope,
-                user_qty=user_qty,
-                selected_accounts=selected_accounts_for_scope,
-                include_targets=True,  # סוכן/משתמש = מציג גם יעדים (read-only)
-            )
-            st.dataframe(
-                cls_tbl,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון"),
-                    "מכירות_בכסף": st.column_config.NumberColumn("מכירות (₪)", format="%.2f"),
-                    "מכירות_בכמות": st.column_config.NumberColumn("מכירות (כמות)", format="%.2f"),
-                    "מחיר_ממוצע": st.column_config.NumberColumn("מחיר ממוצע", format="%.2f"),
-                    "תוספת_יעד_כסף": st.column_config.NumberColumn("תוספת יעד (₪)", format="%.2f"),
-                    "תוספת_יעד_כמות": st.column_config.NumberColumn("תוספת יעד (כמות)", format="%.2f"),
-                    "יעד_בכסף": st.column_config.NumberColumn("2026 (₪)", format="%.2f"),
-                    "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות)", format="%.2f"),
-                },
-            )
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Excel report
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f"### דוח אקסל — {scope_agent_display}")
     st.caption("שם לקוח | מכירות 2025 | מכירות 2026 | הפרש | שינוי % (מבוסס יעדים של המשתמש הנבחר)")
@@ -1478,7 +1347,6 @@ with right:
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Single-customer editing (unchanged behavior)
     if (not (IS_ADMIN and admin_company_wide)) and single:
         account = selected_customers[0]
         df_cust = df_scope.copy()
@@ -1600,5 +1468,5 @@ with right:
             )
 
         st.markdown("</div>", unsafe_allow_html=True)
-    elif (IS_ADMIN and admin_company_wide) and (single or multi):
+    elif (IS_ADMIN and admin_company_wide) and (single or (len(selected_customers) > 1)):
         st.info("בתצוגת חברה מלאה אין עריכת יעדים. כבה את 'תצוגת חברה מלאה' כדי לערוך יעדים לסוכן/משתמש.")
