@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.3.1 (FULL FILE, RTL, Mobile/Tablet friendly)
+Uzeb Sales Targets — v8.3.2 (FULL FILE, RTL, Mobile/Tablet friendly)
 
-FIX (Section 1 requested):
-- Removed Hebrew identifiers from Python syntax (e.g. .agg(מכירות_בכסף=...)).
-- All internal computed column names are ASCII (sales_money, sales_qty, avg_price, delta_qty, ...).
-- Hebrew remains only for UI labels / displayed DataFrame column names.
+Fixes for Streamlit Cloud / GitHub:
+1) No Hebrew identifiers in Python syntax (all internal computed names are ASCII).
+2) Fixed SQLite INSERT placeholders in db_upsert_company_processed (VALUES(1,?,?,?,?)).
 
-Also includes:
+Features preserved:
 - Performance: store raw Excel bytes + preprocessed compressed DF bytes (no re-parse every rerun).
 - ADMIN password: 1511!!
 - ADMIN can create users + disable/delete users
@@ -102,7 +101,7 @@ div.stButton > button { border-radius: 12px !important; font-weight: 900 !import
 )
 
 # =========================
-# Excel Columns (Hebrew source columns are OK)
+# Excel Columns (source file headers)
 # =========================
 COL_AGENT = "סוכן בחשבון"
 COL_ACCOUNT = "שם חשבון"
@@ -235,7 +234,7 @@ db_path = get_db_path()
 con = get_db(str(db_path))
 
 # =========================
-# Serialization helpers (fast load)
+# Serialization helpers
 # =========================
 def df_to_gz_bytes(df: pd.DataFrame) -> bytes:
     bio = BytesIO()
@@ -365,7 +364,6 @@ def normalize_sales_strict(df: pd.DataFrame) -> pd.DataFrame:
     out[COL_AGENT] = out[COL_AGENT].astype("category")
     out[COL_ACCOUNT] = out[COL_ACCOUNT].astype("category")
     out[COL_CLASS] = out[COL_CLASS].astype("category")
-
     return out
 
 
@@ -397,12 +395,13 @@ def db_load_company_file(con_) -> Optional[dict]:
 
 
 def db_upsert_company_processed(con_, source_uploaded_at: str, df_norm: pd.DataFrame):
+    # FIX: placeholders match 5 columns (id fixed to 1 => 4 placeholders)
     now = datetime.now(timezone.utc).isoformat()
     gz_bytes = df_to_gz_bytes(df_norm)
     con_.execute(
         """
         INSERT INTO company_sales_processed(id, source_uploaded_at, df_gz_bytes, created_at, nrows)
-        VALUES(1,?,?,?,?,?)
+        VALUES(1,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             source_uploaded_at=excluded.source_uploaded_at,
             df_gz_bytes=excluded.df_gz_bytes,
@@ -662,7 +661,6 @@ def build_class_view(user_qty: dict, username: str, account: str, df_customer: p
         ]
     ].copy()
 
-    # Rename to Hebrew for UI display
     out = out.rename(
         columns={
             COL_CLASS: "שם קוד מיון פריט",
@@ -845,7 +843,7 @@ def get_company_sales_df(con_) -> pd.DataFrame:
     if proc is not None and str(proc["source_uploaded_at"]) == str(company["uploaded_at"]):
         return load_company_sales_df_cached(proc["source_uploaded_at"], proc["df_gz_bytes"])
 
-    # Self-heal
+    # Self-heal: preprocess once and store
     df_raw = read_sales_excel_bytes(company["file_bytes"])
     df_norm = normalize_sales_strict(df_raw)
     db_upsert_company_processed(con_, company["uploaded_at"], df_norm)
@@ -922,7 +920,6 @@ with st.sidebar:
             usernames = sorted(users_df["username"].astype(str).unique().tolist(), key=lambda x: x.lower())
 
         login_options = [ADMIN_USERNAME] + usernames
-
         u_in = st.selectbox("שם משתמש", options=login_options, index=0, key="login_user")
         p_in = st.text_input("סיסמה", type="password", key="login_pass")
 
@@ -1023,7 +1020,6 @@ with st.sidebar:
 
             wipe_targets = st.checkbox("למחוק גם יעדים (targets) של המשתמש", value=True, key="admin_wipe_targets")
             wipe_file = st.checkbox("למחוק גם קובץ אישי של המשתמש (אם קיים)", value=True, key="admin_wipe_file")
-
             confirm_text = st.text_input("להקליד DELETE כדי לאשר", key="admin_delete_confirm")
 
             if st.button("בצע מחיקה", use_container_width=True, key="admin_delete_btn"):
