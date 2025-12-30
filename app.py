@@ -2,17 +2,17 @@
 """
 Uzeb Sales Targets — v8.3.1 (FULL FILE, RTL, Mobile/Tablet friendly)
 
-DEPLOY FIX:
-- Removed Hebrew Python identifiers (e.g., .agg(מכירות_בכסף=...)) that can become "????" in some deploy pipelines.
-- Use ASCII internal column names and rename to Hebrew only for UI display.
+DEPLOY FIX (the update):
+- Do NOT use Hebrew identifiers in Python syntax (e.g. .agg(מכירות_בכסף=...)).
+- Use ASCII internal names (sales_money/sales_qty/avg_price/delta_qty/...) and rename to Hebrew only for UI.
 
 Also includes v8.3 features:
-- Do NOT read/parse Excel on every rerun: store raw bytes + preprocessed compressed DF bytes
+- Performance: do NOT parse Excel on every rerun. Store raw bytes + processed compressed DF bytes.
 - ADMIN password: 1511!!
 - ADMIN can create users + disable/delete users
 - Company-wide upload: agents see only their sales; ADMIN can view all + filter
 - Customer dropdown shows share next to name
-- KPI shows 2025/2026/diff/%
+- KPI shows 2025/2026/diff/% (2026/2025*100 - 100)
 - Single customer: edit targets by qty + class pick checkbox + items detail
 - Agent Excel report 2025→2026 includes totals row
 """
@@ -159,6 +159,7 @@ def db_connect(db_path: Path):
         """
     )
 
+    # Raw company file
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS company_sales_file (
@@ -170,6 +171,7 @@ def db_connect(db_path: Path):
         """
     )
 
+    # Preprocessed company DF (compressed bytes)
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS company_sales_processed (
@@ -182,6 +184,7 @@ def db_connect(db_path: Path):
         """
     )
 
+    # Optional per-user file (raw)
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS user_sales_file (
@@ -194,6 +197,7 @@ def db_connect(db_path: Path):
         """
     )
 
+    # Optional per-user processed
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS user_sales_processed (
@@ -207,6 +211,7 @@ def db_connect(db_path: Path):
         """
     )
 
+    # Per-user targets (delta qty)
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS user_class_delta_qty (
@@ -585,7 +590,7 @@ def fmt_pct(x) -> str:
 
 
 # =========================
-# Core: compute per-class table (ASCII internals, Hebrew display)
+# Core computations (ASCII internals)
 # =========================
 def compute_classes(df: pd.DataFrame) -> pd.DataFrame:
     g = (
@@ -669,7 +674,7 @@ def build_class_view(user_qty: dict, username: str, account: str, df_customer: p
         ]
     ].copy()
 
-    # Hebrew display names (strings only)
+    # Rename to Hebrew for UI display
     out = out.rename(
         columns={
             COL_CLASS: "שם קוד מיון פריט",
@@ -852,6 +857,7 @@ def get_company_sales_df(con_) -> pd.DataFrame:
     if proc is not None and str(proc["source_uploaded_at"]) == str(company["uploaded_at"]):
         return load_company_sales_df_cached(proc["source_uploaded_at"], proc["df_gz_bytes"])
 
+    # Self-heal: preprocess once and store
     df_raw = read_sales_excel_bytes(company["file_bytes"])
     df_norm = normalize_sales_strict(df_raw)
     db_upsert_company_processed(con_, company["uploaded_at"], df_norm)
@@ -953,7 +959,7 @@ with st.sidebar:
             st.rerun()
 
 # =========================
-# Sidebar: ADMIN actions
+# Sidebar: ADMIN actions (company file + create/delete users)
 # =========================
 with st.sidebar:
     if st.session_state.get("logged_in") and st.session_state.get("is_admin"):
@@ -975,9 +981,12 @@ with st.sidebar:
         if up_company is not None:
             try:
                 uploaded_at = db_upsert_company_file(con, up_company.name, up_company.getvalue())
+
+                # preprocess once NOW (performance)
                 df_raw = read_sales_excel_bytes(up_company.getvalue())
                 df_norm = normalize_sales_strict(df_raw)
                 db_upsert_company_processed(con, uploaded_at, df_norm)
+
                 st.success("קובץ חברה נשמר + עיבוד נתונים בוצע.")
                 st.rerun()
             except Exception as e:
@@ -1114,7 +1123,7 @@ else:
 
         cand = users_df[users_df["agent_id"].astype(str) == str(chosen_agent_id)].copy()
         cand["label"] = cand.apply(
-            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (f" | {r['agent_name']}" if r['agent_name'] else ""),
+            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (f" | {r['agent_name']}" if r["agent_name"] else ""),
             axis=1,
         )
         labels = cand["label"].tolist()
@@ -1131,7 +1140,7 @@ else:
         st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# Load per-user targets
+# Load per-user targets (only relevant when not company-wide admin)
 # =========================
 user_qty = {}
 qty_key = f"user_qty::{context_username}"
@@ -1141,7 +1150,7 @@ if not (IS_ADMIN and admin_company_wide):
     user_qty = st.session_state[qty_key]
 
 # =========================
-# DATA SOURCE selection
+# DATA SOURCE selection (company processed DF; optional personal processed DF)
 # =========================
 company_saved = db_load_company_file(con)
 if company_saved is None:
@@ -1166,6 +1175,7 @@ if not IS_ADMIN and personal_df is not None:
     data_source = "company" if "חברה" in data_source else "personal"
     st.markdown("</div>", unsafe_allow_html=True)
 
+# FAST: get company processed df (no excel parsing unless missing/outdated)
 with st.spinner("טוען נתונים..."):
     company_df = get_company_sales_df(con)
 
@@ -1214,9 +1224,6 @@ cust_table["share_pct"] = cust_table["sum_money"].apply(
     lambda x: safe_div(float(x), scope_total_2025) * 100 if scope_total_2025 > 0 else math.nan
 )
 
-# Hebrew display for table
-cust_table_disp = cust_table.rename(columns={COL_ACCOUNT: "שם לקוח", "sum_money": "סהכ_כסף", "sum_qty": "סהכ_כמות", "share_pct": "נתח (%)"})
-
 share_map = dict(zip(cust_table[COL_ACCOUNT].astype(str).tolist(), cust_table["share_pct"].tolist()))
 customer_options = cust_table[COL_ACCOUNT].astype(str).tolist()
 
@@ -1245,6 +1252,9 @@ with left:
     )
 
     st.markdown("#### טבלת לקוחות — 2025")
+    cust_table_disp = cust_table.rename(
+        columns={COL_ACCOUNT: "שם לקוח", "sum_money": "סהכ_כסף", "sum_qty": "סהכ_כמות", "share_pct": "נתח (%)"}
+    )
     st.dataframe(
         cust_table_disp[["שם לקוח", "סהכ_כסף", "סהכ_כמות", "נתח (%)"]],
         use_container_width=True,
@@ -1358,7 +1368,6 @@ with right:
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Single customer editing
     if (not (IS_ADMIN and admin_company_wide)) and single:
         account = selected_customers[0]
         df_cust = df_scope.copy()
@@ -1461,7 +1470,9 @@ with right:
                 .sort_values("sales_money", ascending=False)
                 .reset_index(drop=True)
             )
-            items_sum = items_sum.rename(columns={COL_CLASS: "קוד מיון", COL_ITEM: "שם פריט", "sales_money": "מכירות_בכסף", "sales_qty": "מכירות_בכמות"})
+            items_sum = items_sum.rename(
+                columns={COL_CLASS: "קוד מיון", COL_ITEM: "שם פריט", "sales_money": "מכירות_בכסף", "sales_qty": "מכירות_בכמות"}
+            )
             st.dataframe(
                 items_sum[["קוד מיון", "שם פריט", "מכירות_בכסף", "מכירות_בכמות"]],
                 use_container_width=True,
