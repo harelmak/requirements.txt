@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.3 (FULL FILE, RTL, Mobile/Tablet friendly)
+Uzeb Sales Targets — v8.3.1 (FULL FILE, RTL, Mobile/Tablet friendly)
 
-UPDATED per Section 1 (performance): Do NOT read/parse Excel on every rerun.
-- When ADMIN uploads Company Excel:
-  * Save raw Excel bytes (company_sales_file)
-  * Preprocess once: read_excel + normalize_sales -> store as compressed DF bytes (company_sales_processed)
-- On app runs:
-  * Load preprocessed DF bytes (fast) if matches latest upload timestamp
-  * If missing/outdated -> self-heal: preprocess once and store
+DEPLOY FIX:
+- Removed Hebrew Python identifiers (e.g., .agg(מכירות_בכסף=...)) that can become "????" in some deploy pipelines.
+- Use ASCII internal column names and rename to Hebrew only for UI display.
 
-Also preserved from v8.2:
-- ADMIN password fixed: 1511!!
+Also includes v8.3 features:
+- Do NOT read/parse Excel on every rerun: store raw bytes + preprocessed compressed DF bytes
+- ADMIN password: 1511!!
 - ADMIN can create users + disable/delete users
 - Company-wide upload: agents see only their sales; ADMIN can view all + filter
 - Customer dropdown shows share next to name
-- KPI shows 2025/2026/diff/% (2026/2025*100 - 100)
-- Single customer: edit targets + class pick checkbox + items detail
+- KPI shows 2025/2026/diff/%
+- Single customer: edit targets by qty + class pick checkbox + items detail
 - Agent Excel report 2025→2026 includes totals row
 """
 
@@ -162,7 +159,6 @@ def db_connect(db_path: Path):
         """
     )
 
-    # Raw company file
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS company_sales_file (
@@ -174,7 +170,6 @@ def db_connect(db_path: Path):
         """
     )
 
-    # Preprocessed company DF (compressed bytes)
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS company_sales_processed (
@@ -187,7 +182,6 @@ def db_connect(db_path: Path):
         """
     )
 
-    # Optional per-user file (raw)
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS user_sales_file (
@@ -200,7 +194,6 @@ def db_connect(db_path: Path):
         """
     )
 
-    # Optional per-user processed
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS user_sales_processed (
@@ -214,7 +207,6 @@ def db_connect(db_path: Path):
         """
     )
 
-    # Per-user targets
     con_.execute(
         """
         CREATE TABLE IF NOT EXISTS user_class_delta_qty (
@@ -247,7 +239,6 @@ con = get_db(str(db_path))
 def df_to_gz_bytes(df: pd.DataFrame) -> bytes:
     bio = BytesIO()
     with gzip.GzipFile(fileobj=bio, mode="wb") as gz:
-        # pickle is fastest/portable here
         pd.to_pickle(df, gz)
     return bio.getvalue()
 
@@ -370,7 +361,6 @@ def normalize_sales_strict(df: pd.DataFrame) -> pd.DataFrame:
     out[COL_QTY] = pd.to_numeric(out[COL_QTY], errors="coerce").fillna(0.0)
     out[COL_NET] = pd.to_numeric(out[COL_NET], errors="coerce").fillna(0.0)
 
-    # memory/perf: categories help big groupbys
     out[COL_AGENT] = out[COL_AGENT].astype("category")
     out[COL_ACCOUNT] = out[COL_ACCOUNT].astype("category")
     out[COL_CLASS] = out[COL_CLASS].astype("category")
@@ -594,15 +584,18 @@ def fmt_pct(x) -> str:
     return f"{float(x):,.1f}%"
 
 
+# =========================
+# Core: compute per-class table (ASCII internals, Hebrew display)
+# =========================
 def compute_classes(df: pd.DataFrame) -> pd.DataFrame:
     g = (
         df.groupby(COL_CLASS, dropna=False)
-        .agg(מכירות_בכסף=(COL_NET, "sum"), מכירות_בכמות=(COL_QTY, "sum"))
+        .agg(**{"sales_money": (COL_NET, "sum"), "sales_qty": (COL_QTY, "sum")})
         .reset_index()
-        .sort_values("מכירות_בכסף", ascending=False)
+        .sort_values("sales_money", ascending=False)
         .reset_index(drop=True)
     )
-    g["מחיר_ממוצע"] = g.apply(lambda r: safe_div(r["מכירות_בכסף"], r["מכירות_בכמות"]), axis=1)
+    g["avg_price"] = g.apply(lambda r: safe_div(r["sales_money"], r["sales_qty"]), axis=1)
     return g
 
 
@@ -650,35 +643,46 @@ def get_delta_qty(user_qty: dict, username: str, account: str, cls: str) -> floa
 def build_class_view(user_qty: dict, username: str, account: str, df_customer: pd.DataFrame) -> pd.DataFrame:
     class_df = compute_classes(df_customer)
 
-    class_df["תוספת_יעד_כמות"] = class_df.apply(
-        lambda r: get_delta_qty(user_qty, username, account, str(r[COL_CLASS])),
-        axis=1,
-    )
+    class_df["delta_qty"] = class_df[COL_CLASS].astype(str).apply(lambda c: get_delta_qty(user_qty, username, account, c))
 
-    def qty_to_money(r):
-        p = r["מחיר_ממוצע"]
-        dq = float(r["תוספת_יעד_כמות"] or 0.0)
+    def qty_to_money_row(r):
+        p = r["avg_price"]
+        dq = float(r["delta_qty"] or 0.0)
         if pd.isna(p) or float(p) == 0:
             return 0.0
         return dq * float(p)
 
-    class_df["תוספת_יעד_כסף"] = class_df.apply(qty_to_money, axis=1)
-    class_df["יעד_בכסף"] = class_df["מכירות_בכסף"] + class_df["תוספת_יעד_כסף"]
-    class_df["יעד_בכמות"] = class_df["מכירות_בכמות"] + class_df["תוספת_יעד_כמות"]
+    class_df["delta_money"] = class_df.apply(qty_to_money_row, axis=1)
+    class_df["target_money"] = class_df["sales_money"] + class_df["delta_money"]
+    class_df["target_qty"] = class_df["sales_qty"] + class_df["delta_qty"]
 
     out = class_df[
         [
             COL_CLASS,
-            "מכירות_בכסף",
-            "מכירות_בכמות",
-            "מחיר_ממוצע",
-            "תוספת_יעד_כסף",
-            "תוספת_יעד_כמות",
-            "יעד_בכסף",
-            "יעד_בכמות",
+            "sales_money",
+            "sales_qty",
+            "avg_price",
+            "delta_money",
+            "delta_qty",
+            "target_money",
+            "target_qty",
         ]
     ].copy()
-    return out.rename(columns={COL_CLASS: "שם קוד מיון פריט"})
+
+    # Hebrew display names (strings only)
+    out = out.rename(
+        columns={
+            COL_CLASS: "שם קוד מיון פריט",
+            "sales_money": "מכירות_בכסף",
+            "sales_qty": "מכירות_בכמות",
+            "avg_price": "מחיר_ממוצע",
+            "delta_money": "תוספת_יעד_כסף",
+            "delta_qty": "תוספת_יעד_כמות",
+            "target_money": "יעד_בכסף",
+            "target_qty": "יעד_בכמות",
+        }
+    )
+    return out
 
 
 def compute_scope_kpi(username: str, df_scope: pd.DataFrame, user_qty: dict, selected_accounts: Optional[list[str]]):
@@ -701,19 +705,19 @@ def compute_scope_kpi(username: str, df_scope: pd.DataFrame, user_qty: dict, sel
                 total += float(dq or 0.0)
         return total
 
-    class_sales["תוספת_יעד_כמות"] = class_sales[COL_CLASS].astype(str).apply(agg_qty_delta)
+    class_sales["delta_qty"] = class_sales[COL_CLASS].astype(str).apply(agg_qty_delta)
 
     def qty_to_money_row(r):
-        p = r["מחיר_ממוצע"]
-        dq = float(r["תוספת_יעד_כמות"] or 0.0)
+        p = r["avg_price"]
+        dq = float(r["delta_qty"] or 0.0)
         if pd.isna(p) or float(p) == 0:
             return 0.0
         return dq * float(p)
 
-    class_sales["תוספת_יעד_כסף"] = class_sales.apply(qty_to_money_row, axis=1)
+    class_sales["delta_money"] = class_sales.apply(qty_to_money_row, axis=1)
 
-    s2025 = float(pd.to_numeric(class_sales["מכירות_בכסף"], errors="coerce").fillna(0.0).sum())
-    add_money = float(pd.to_numeric(class_sales["תוספת_יעד_כסף"], errors="coerce").fillna(0.0).sum())
+    s2025 = float(pd.to_numeric(class_sales["sales_money"], errors="coerce").fillna(0.0).sum())
+    add_money = float(pd.to_numeric(class_sales["delta_money"], errors="coerce").fillna(0.0).sum())
     s2026 = s2025 + add_money
     diff = s2026 - s2025
     pct = (safe_div(s2026, s2025) * 100 - 100) if s2025 > 0 else math.nan
@@ -836,7 +840,6 @@ def make_agent_sales_excel(title: str, df_report: pd.DataFrame) -> bytes:
 # =========================
 @st.cache_data(show_spinner=False)
 def load_company_sales_df_cached(source_uploaded_at: str, gz_bytes: bytes) -> pd.DataFrame:
-    # cache key includes uploaded_at + content bytes hash implicitly by Streamlit
     return df_from_gz_bytes(gz_bytes)
 
 
@@ -849,7 +852,6 @@ def get_company_sales_df(con_) -> pd.DataFrame:
     if proc is not None and str(proc["source_uploaded_at"]) == str(company["uploaded_at"]):
         return load_company_sales_df_cached(proc["source_uploaded_at"], proc["df_gz_bytes"])
 
-    # Self-heal: preprocess once and store
     df_raw = read_sales_excel_bytes(company["file_bytes"])
     df_norm = normalize_sales_strict(df_raw)
     db_upsert_company_processed(con_, company["uploaded_at"], df_norm)
@@ -951,7 +953,7 @@ with st.sidebar:
             st.rerun()
 
 # =========================
-# Sidebar: ADMIN actions (company file + create/delete users)
+# Sidebar: ADMIN actions
 # =========================
 with st.sidebar:
     if st.session_state.get("logged_in") and st.session_state.get("is_admin"):
@@ -973,12 +975,9 @@ with st.sidebar:
         if up_company is not None:
             try:
                 uploaded_at = db_upsert_company_file(con, up_company.name, up_company.getvalue())
-
-                # preprocess once NOW (section 1)
                 df_raw = read_sales_excel_bytes(up_company.getvalue())
                 df_norm = normalize_sales_strict(df_raw)
                 db_upsert_company_processed(con, uploaded_at, df_norm)
-
                 st.success("קובץ חברה נשמר + עיבוד נתונים בוצע.")
                 st.rerun()
             except Exception as e:
@@ -1115,7 +1114,7 @@ else:
 
         cand = users_df[users_df["agent_id"].astype(str) == str(chosen_agent_id)].copy()
         cand["label"] = cand.apply(
-            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (f" | {r['agent_name']}" if r["agent_name"] else ""),
+            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (f" | {r['agent_name']}" if r['agent_name'] else ""),
             axis=1,
         )
         labels = cand["label"].tolist()
@@ -1132,7 +1131,7 @@ else:
         st.markdown("</div>", unsafe_allow_html=True)
 
 # =========================
-# Load per-user targets (only relevant when not company-wide admin)
+# Load per-user targets
 # =========================
 user_qty = {}
 qty_key = f"user_qty::{context_username}"
@@ -1142,7 +1141,7 @@ if not (IS_ADMIN and admin_company_wide):
     user_qty = st.session_state[qty_key]
 
 # =========================
-# DATA SOURCE selection (company processed DF; optional personal processed DF)
+# DATA SOURCE selection
 # =========================
 company_saved = db_load_company_file(con)
 if company_saved is None:
@@ -1167,7 +1166,6 @@ if not IS_ADMIN and personal_df is not None:
     data_source = "company" if "חברה" in data_source else "personal"
     st.markdown("</div>", unsafe_allow_html=True)
 
-# FAST: get company processed df (no excel parsing unless missing/outdated)
 with st.spinner("טוען נתונים..."):
     company_df = get_company_sales_df(con)
 
@@ -1207,16 +1205,19 @@ scope_total_2025 = float(scope_df[COL_NET].sum())
 
 cust_table = (
     scope_df.groupby(COL_ACCOUNT)
-    .agg(סהכ_כסף=(COL_NET, "sum"), סהכ_כמות=(COL_QTY, "sum"))
+    .agg(**{"sum_money": (COL_NET, "sum"), "sum_qty": (COL_QTY, "sum")})
     .reset_index()
-    .sort_values("סהכ_כסף", ascending=False)
+    .sort_values("sum_money", ascending=False)
     .reset_index(drop=True)
 )
-cust_table["נתח (%)"] = cust_table["סהכ_כסף"].apply(
+cust_table["share_pct"] = cust_table["sum_money"].apply(
     lambda x: safe_div(float(x), scope_total_2025) * 100 if scope_total_2025 > 0 else math.nan
 )
 
-share_map = dict(zip(cust_table[COL_ACCOUNT].astype(str).tolist(), cust_table["נתח (%)"].tolist()))
+# Hebrew display for table
+cust_table_disp = cust_table.rename(columns={COL_ACCOUNT: "שם לקוח", "sum_money": "סהכ_כסף", "sum_qty": "סהכ_כמות", "share_pct": "נתח (%)"})
+
+share_map = dict(zip(cust_table[COL_ACCOUNT].astype(str).tolist(), cust_table["share_pct"].tolist()))
 customer_options = cust_table[COL_ACCOUNT].astype(str).tolist()
 
 
@@ -1245,11 +1246,11 @@ with left:
 
     st.markdown("#### טבלת לקוחות — 2025")
     st.dataframe(
-        cust_table[[COL_ACCOUNT, "סהכ_כסף", "סהכ_כמות", "נתח (%)"]],
+        cust_table_disp[["שם לקוח", "סהכ_כסף", "סהכ_כמות", "נתח (%)"]],
         use_container_width=True,
         hide_index=True,
         column_config={
-            COL_ACCOUNT: st.column_config.TextColumn("שם לקוח"),
+            "שם לקוח": st.column_config.TextColumn("שם לקוח"),
             "סהכ_כסף": st.column_config.NumberColumn("מכירות 2025 (₪)", format="%.2f"),
             "סהכ_כמות": st.column_config.NumberColumn("כמות", format="%.2f"),
             "נתח (%)": st.column_config.NumberColumn("נתח (%)", format="%.1f"),
@@ -1306,9 +1307,9 @@ with right:
     if IS_ADMIN and admin_company_wide:
         rep = (
             df_scope.groupby(COL_ACCOUNT)
-            .agg(**{"מכירות 2025": (COL_NET, "sum")})
+            .agg(**{"sales_2025": (COL_NET, "sum")})
             .reset_index()
-            .rename(columns={COL_ACCOUNT: "שם לקוח"})
+            .rename(columns={COL_ACCOUNT: "שם לקוח", "sales_2025": "מכירות 2025"})
             .sort_values("מכירות 2025", ascending=False)
             .reset_index(drop=True)
         )
@@ -1357,6 +1358,7 @@ with right:
         )
     st.markdown("</div>", unsafe_allow_html=True)
 
+    # Single customer editing
     if (not (IS_ADMIN and admin_company_wide)) and single:
         account = selected_customers[0]
         df_cust = df_scope.copy()
@@ -1454,12 +1456,12 @@ with right:
             items_df = df_cust[df_cust[COL_CLASS].astype(str) == str(chosen_cls)].copy()
             items_sum = (
                 items_df.groupby([COL_CLASS, COL_ITEM], dropna=False)
-                .agg(מכירות_בכסף=(COL_NET, "sum"), מכירות_בכמות=(COL_QTY, "sum"))
+                .agg(**{"sales_money": (COL_NET, "sum"), "sales_qty": (COL_QTY, "sum")})
                 .reset_index()
-                .sort_values("מכירות_בכסף", ascending=False)
+                .sort_values("sales_money", ascending=False)
                 .reset_index(drop=True)
             )
-            items_sum = items_sum.rename(columns={COL_CLASS: "קוד מיון", COL_ITEM: "שם פריט"})
+            items_sum = items_sum.rename(columns={COL_CLASS: "קוד מיון", COL_ITEM: "שם פריט", "sales_money": "מכירות_בכסף", "sales_qty": "מכירות_בכמות"})
             st.dataframe(
                 items_sum[["קוד מיון", "שם פריט", "מכירות_בכסף", "מכירות_בכמות"]],
                 use_container_width=True,
@@ -1471,5 +1473,6 @@ with right:
             )
 
         st.markdown("</div>", unsafe_allow_html=True)
+
     elif (IS_ADMIN and admin_company_wide) and (single or multi):
         st.info("בתצוגת חברה מלאה אין עריכת יעדים. כבה את 'תצוגת חברה מלאה' כדי לערוך יעדים לסוכן/משתמש.")
