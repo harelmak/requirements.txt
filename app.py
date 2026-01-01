@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.6 (FULL FILE)
+Uzeb Sales Targets — v8.6.1 (FULL FILE)
 
 NEW (per request):
-- In "עריכת יעדים (לקוח יחיד)" added "פירוט פריטים" with:
-  1) סינון לפי קוד מיון (dropdown)
-  2) חיפוש לפי שם פריט (contains)
-  3) טבלת פירוט פריטים (אגרגציה לפי פריט) בהתאם להרשאות עמודות
+- In "עריכת יעדים (לקוח יחיד)" added "סינון עמודות" (per-user/per-customer):
+  - multiselect to choose which columns to display in the data_editor
+  - enforced mandatory columns: "שם קוד מיון פריט", "תוספת_יעד_כמות"
+  - respects permissions for money/qty/item columns (editable target qty always available)
 
-Everything else kept as in v8.5.3.
+Everything else kept as in v8.6.
 """
 
 import base64
@@ -1713,8 +1713,45 @@ with right:
 
         base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
 
+        # ========= NEW: Column filter for all users (per user + customer) =========
+        st.markdown("#### סינון עמודות בטבלה")
+
+        col_pick_key = f"targets_cols_pick::{context_username}::{context_agent_id}::{account}"
+
+        # Allowed columns (respect permissions; editable target qty always allowed)
         if CAN_SEE_MONEY:
-            editor_df = base_df[
+            allowed_cols = ["שם קוד מיון פריט", "מכירות_בכסף", "מחיר_ממוצע", "תוספת_יעד_כמות", "תוספת_יעד_כסף", "יעד_בכסף"]
+            if CAN_SEE_QTY:
+                allowed_cols += ["מכירות_בכמות", "יעד_בכמות"]
+        else:
+            allowed_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
+            if CAN_SEE_QTY:
+                allowed_cols += ["מכירות_בכמות", "יעד_בכמות"]
+
+        # Mandatory columns for editing
+        mandatory = [c for c in ["שם קוד מיון פריט", "תוספת_יעד_כמות"] if c in allowed_cols]
+
+        if col_pick_key not in st.session_state:
+            st.session_state[col_pick_key] = allowed_cols.copy()
+
+        picked_cols = st.multiselect(
+            "בחר עמודות להצגה",
+            options=allowed_cols,
+            default=[c for c in st.session_state[col_pick_key] if c in allowed_cols],
+            key=col_pick_key,
+        )
+
+        for c in mandatory:
+            if c not in picked_cols:
+                picked_cols.append(c)
+
+        # Keep stable order
+        picked_cols = [c for c in allowed_cols if c in set(picked_cols)]
+        # ========= END NEW =========
+
+        # Build editor_df + column_config
+        if CAN_SEE_MONEY:
+            editor_df_full = base_df[
                 [
                     "שם קוד מיון פריט",
                     "מכירות_בכסף",
@@ -1737,11 +1774,17 @@ with right:
                 "יעד_בכסף": st.column_config.NumberColumn("2026 (₪)", disabled=True, format="%.2f"),
                 "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות)", disabled=True, format="%.2f"),
             }
+
+            # Apply permissions for qty columns in money view (but keep editable target qty)
+            if not CAN_SEE_QTY:
+                for c in ["מכירות_בכמות", "יעד_בכמות"]:
+                    if c in editor_df_full.columns:
+                        editor_df_full = editor_df_full.drop(columns=[c])
         else:
             editor_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
             if CAN_SEE_QTY:
                 editor_cols += ["מכירות_בכמות", "יעד_בכמות"]
-            editor_df = base_df[editor_cols].copy()
+            editor_df_full = base_df[editor_cols].copy()
 
             column_config = {
                 "שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון", disabled=True),
@@ -1754,6 +1797,10 @@ with right:
                         "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות)", disabled=True, format="%.2f"),
                     }
                 )
+
+        # Apply chosen columns (mandatory already enforced)
+        editor_df = editor_df_full[[c for c in picked_cols if c in editor_df_full.columns]].copy()
+        column_config = {k: v for k, v in column_config.items() if k in editor_df.columns}
 
         with st.form(key=f"targets_form::{context_username}::{context_agent_id}::{account}", clear_on_submit=False):
             edited = st.data_editor(
@@ -1770,6 +1817,11 @@ with right:
                 save_clicked = st.form_submit_button("שמור למסד", use_container_width=True)
 
         if refresh_clicked or save_clicked:
+            # Ensure column exists (mandatory), then recompute/save
+            if "תוספת_יעד_כמות" not in edited.columns:
+                st.error('חובה להציג את העמודה "תוספת_יעד_כמות" כדי לערוך יעד.')
+                st.stop()
+
             edited["תוספת_יעד_כמות"] = pd.to_numeric(edited["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
 
             for _, r in edited.iterrows():
@@ -1791,7 +1843,7 @@ with right:
 
             st.success("נשמר ועודכן." if save_clicked else "עודכן.")
 
-        # ========= NEW: Items breakdown with filters =========
+        # ========= Items breakdown with filters =========
         st.markdown("---")
         st.markdown("### פירוט פריטים (סינון לפי קוד מיון + חיפוש בשם פריט)")
 
@@ -1800,7 +1852,6 @@ with right:
         elif not CAN_SEE_ITEM:
             st.caption('לפי הרשאות התצוגה, למשתמש רגיל אין גישה לעמודת "שם פריט". (ADMIN יכול להפעיל זאת במסך ניהול תצוגה).')
         else:
-            # Filters
             all_classes = (
                 df_cust[COL_CLASS].dropna().astype(str).unique().tolist()
                 if COL_CLASS in df_cust.columns
@@ -1840,7 +1891,6 @@ with right:
                 if cls_pick == "(הכל)" and COL_CLASS in items_df.columns:
                     grp_cols = [COL_CLASS, COL_ITEM]
 
-                # Aggregate
                 agg_map = {}
                 if CAN_SEE_MONEY:
                     agg_map["מכירות_בכסף"] = (COL_NET, "sum")
@@ -1856,11 +1906,9 @@ with right:
                         .reset_index()
                     )
 
-                    # sort
                     sort_col = "מכירות_בכסף" if ("מכירות_בכסף" in items_sum.columns) else "מכירות_בכמות"
                     items_sum = items_sum.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
-                    # rename headers for display
                     if COL_CLASS in items_sum.columns:
                         items_sum = items_sum.rename(columns={COL_CLASS: "קוד מיון"})
                     items_sum = items_sum.rename(columns={COL_ITEM: "שם פריט"})
