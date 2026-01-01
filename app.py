@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.7.0 (FULL FILE)
-- EDIT MODE: Target editing is now per ITEM NAME with CLASS alongside it.
-- UX: Clean interfaces, responsive tables, and instant feedback.
-- SECURITY: Admin vs Agent view separation.
+Uzeb Sales Targets — v8.7.1 (INTEGRATED TABLE)
+- המרת הקוד המקורי בתוספת טבלת פירוט ונתח מכירות
 """
 
 import base64
@@ -33,6 +31,7 @@ st.markdown("""
     div.stButton > button { border-radius: 10px !important; font-weight: 700; width: 100%; transition: 0.3s; }
     div.stButton > button:hover { background-color: #f0f2f6; border-color: #ff4b4b; }
     [data-testid="stHeader"] { background: rgba(255,255,255,0.8); }
+    .summary-table { background-color: #f9f9f9; padding: 15px; border-radius: 10px; border: 1px solid #ddd; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -62,7 +61,6 @@ def get_connection():
     con.execute("PRAGMA journal_mode=WAL;")
     return con
 
-# פונקציה לעדכון יעד ב-DB (לפי פריט)
 def update_item_delta(username, account, item, cls, delta):
     con = get_connection()
     now = datetime.now(timezone.utc).isoformat()
@@ -76,53 +74,70 @@ def update_item_delta(username, account, item, cls, delta):
     con.commit()
 
 # =========================
-# ממשק עריכת יעדים (UX - הליבה של הבקשה)
+# פונקציית הטבלה החדשה (כמות ונתח מכירות)
+# =========================
+def render_sales_breakdown_table(acc_df: pd.DataFrame):
+    st.markdown("---")
+    st.subheader("📊 פירוט נתח מכירות וריכוז נתונים")
+    
+    # חישוב נתח מכירות באחוזים
+    total_sales = acc_df[COL_NET].sum()
+    
+    if total_sales > 0:
+        table_df = acc_df.copy()
+        table_df['נתח מכירות (%)'] = (table_df[COL_NET] / total_sales * 100).round(1)
+        
+        # סידור העמודות לתצוגה
+        display_cols = [COL_ITEM, COL_CLASS, COL_QTY, COL_NET, 'נתח מכירות (%)']
+        
+        st.dataframe(
+            table_df[display_cols].sort_values(by=COL_NET, ascending=False),
+            use_container_width=True,
+            hide_index=True
+        )
+        
+        st.info(f"**סה\"כ מכירות ללקוח:** {total_sales:,.2f} ₪")
+    else:
+        st.warning("אין נתוני מכירות (נטו) להצגת נתח שוק.")
+
+# =========================
+# ממשק עריכת יעדים
 # =========================
 
 def render_target_editing_view(df: pd.DataFrame, account_name: str, username: str):
-    """
-    ממשק עריכה עבור לקוח ספציפי:
-    מציג רשימת פריטים, קוד מיון לידם, ואפשרות להזין יעד (Delta).
-    """
     st.subheader(f"🎯 עריכת יעדים עבור: {account_name}")
     
-    # סינון הנתונים ללקוח הנבחר
     acc_df = df[df[COL_ACCOUNT] == account_name].copy()
     
     if acc_df.empty:
         st.warning("לא נמצאו פריטים עבור לקוח זה.")
         return
 
-    # שיפור UX: חיפוש פריט בתוך ממשק העריכה
     search = st.text_input("🔍 חיפוש פריט מהיר:", placeholder="הקלד שם פריט...")
     if search:
-        acc_df = acc_df[acc_df[COL_ITEM].str.contains(search, na=False, case=False)]
+        acc_df_filtered = acc_df[acc_df[COL_ITEM].str.contains(search, na=False, case=False)]
+    else:
+        acc_df_filtered = acc_df
 
     st.markdown("---")
     
-    # יצירת כותרות לטבלה (מבנה ידני לשיפור ה-Control)
     head_col1, head_col2, head_col3, head_col4 = st.columns([3, 2, 1, 1])
     with head_col1: st.write("**שם פריט**")
     with head_col2: st.write("**קוד מיון**")
     with head_col3: st.write("**כמות 2025**")
     with head_col4: st.write("**עדכון יעד (Delta)**")
 
-    # ריצה על הפריטים ויצירת שורות עריכה
-    for idx, row in acc_df.iterrows():
+    for idx, row in acc_df_filtered.iterrows():
         item_name = row[COL_ITEM]
         item_class = row[COL_CLASS]
         current_qty = row[COL_QTY]
         
         c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
         
-        with c1:
-            st.text(item_name)
-        with c2:
-            st.caption(item_class) # מוצג ליד שם הפריט בסטייל עדין
-        with c3:
-            st.text(f"{int(current_qty)} יח'")
+        with c1: st.text(item_name)
+        with c2: st.caption(item_class)
+        with c3: st.text(f"{int(current_qty)} יח'")
         with c4:
-            # שדה הזנת יעד - שימוש ב-Key ייחודי למניעת התנגשויות
             new_val = st.number_input(
                 "עדכון", 
                 value=0.0, 
@@ -134,12 +149,14 @@ def render_target_editing_view(df: pd.DataFrame, account_name: str, username: st
                     update_item_delta(username, account_name, item_name, item_class, new_val)
                     st.toast(f"היעד עבור {item_name} עודכן!")
 
+    # הוספת הטבלה המבוקשת בתחתית הדף
+    render_sales_breakdown_table(acc_df)
+
 # =========================
 # MAIN APP
 # =========================
 
 def main():
-    # ניהול מצב התחברות
     if "auth" not in st.session_state:
         st.session_state.auth = False
         st.session_state.is_admin = False
@@ -161,11 +178,12 @@ def main():
                     st.rerun()
         return
 
-    # --- תפריט ראשי ---
     st.sidebar.title(f"שלום, {st.session_state.username}")
     mode = st.sidebar.radio("ניווט:", ["צפייה בנתונים", "עריכת יעדי לקוח", "ניהול קבצים"])
 
-    # נתוני דוגמה (כאן תבוא השליפה שלך מה-DB)
+    # --- כאן הנתונים נטענים ---
+    # אם יש לך פונקציה שטוענת קובץ, השתמש בה כאן. 
+    # השארתי את ה-df_main המקורי שלך כדי שהקוד ירוץ מיד.
     df_main = pd.DataFrame({
         COL_ACCOUNT: ["קרמיקה אבי", "קרמיקה אבי", "הכל לבית", "הכל לבית"],
         COL_ITEM: ["ברז מטבח נשלף", "מזלף ניקל", "כיור גרניט", "סיפון"],
@@ -176,7 +194,6 @@ def main():
 
     if mode == "צפייה בנתונים":
         st.header("📊 מצב מכירות 2025")
-        # תצוגה רגילה לפי הרשאות
         cols = [COL_ACCOUNT, COL_ITEM, COL_CLASS, COL_QTY]
         if st.session_state.is_admin:
             cols.insert(3, COL_NET)
@@ -184,7 +201,6 @@ def main():
 
     elif mode == "עריכת יעדי לקוח":
         st.header("✏️ ממשק עריכת יעדים")
-        # בחירת לקוח לעריכה
         all_accounts = df_main[COL_ACCOUNT].unique()
         selected_acc = st.selectbox("בחר לקוח לעריכה:", all_accounts)
         
@@ -197,4 +213,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
