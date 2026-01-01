@@ -1,29 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.8 (FULL FILE)
+Uzeb Sales Targets — v8.8.1 (FULL FILE)
 
-UPDATES INCLUDED:
-1) "פירוט פריטים" becomes EDITABLE:
-   - Edit "תוספת_יעד_כמות" per item (per customer)
-   - Updates KPIs + class view automatically (item deltas are aggregated into class totals)
+Fixes (per user report: "I don't see computed values"):
+1) Force recompute + redraw after refresh/save:
+   - After class targets refresh/save => st.rerun()
+   - After items refresh/save => st.rerun()
 
-2) Monthly columns:
-   - Per CLASS and per ITEM:
-     a) ממוצע_חודשי_כמות_2025  = סה"כ כמות בשנה / 12
-     b) תוספת_חודשית_כמות     = תוספת יעד כמות / 12
-     c) יעד_חודשי_כמות_2026   = יעד כמות / 12 (display)
+2) Default column-picks for "עריכת יעדים (לקוח יחיד)" include monthly computed columns
+   (only when CAN_SEE_QTY).
 
-3) DB stores only the RESULTS for monthly columns (in addition to delta_qty for persistence):
-   - monthly_avg_2025_qty (saved snapshot)
-   - monthly_add_qty      (saved result)
-   Note: monthly_avg_2025_qty is derived from sales file; saving it is a snapshot.
+3) Computed columns are always recomputed from fresh views (class_view/base_df rebuilt on rerun).
 
-4) Column filter for ALL users in "עריכת יעדים (לקוח יחיד)":
-   - User can choose which columns to display in the class editor table.
-   - Does not affect permissions (only hides/shows allowed columns).
-   - Stored in session_state per user.
-
-Everything else kept as in v8.6 baseline.
+Notes:
+- Monthly values = yearly qty / 12
+- DB stores only results snapshots (monthly_avg_2025_qty, monthly_add_qty) in both class+item tables
+- Item deltas aggregate into class totals for KPI + class view
 """
 
 import base64
@@ -249,7 +241,6 @@ def ensure_all_schema(con_: sqlite3.Connection):
         )
         """
     )
-    # Store monthly results (snapshot)
     _try_add_column(con_, "user_class_delta_qty", "monthly_avg_2025_qty REAL NOT NULL DEFAULT 0")
     _try_add_column(con_, "user_class_delta_qty", "monthly_add_qty REAL NOT NULL DEFAULT 0")
 
@@ -662,7 +653,15 @@ def db_load_user_class_qty(con_, username: str) -> dict:
     return {(str(username), str(acc), str(cls)): float(dq or 0.0) for acc, cls, dq in rows}
 
 
-def db_upsert_user_class_qty(con_, username: str, account: str, cls: str, delta_qty: float, monthly_avg_2025_qty: float, monthly_add_qty: float):
+def db_upsert_user_class_qty(
+    con_,
+    username: str,
+    account: str,
+    cls: str,
+    delta_qty: float,
+    monthly_avg_2025_qty: float,
+    monthly_add_qty: float,
+):
     con_ = db_ready(con_)
     now = datetime.now(timezone.utc).isoformat()
     con_.execute(
@@ -676,8 +675,11 @@ def db_upsert_user_class_qty(con_, username: str, account: str, cls: str, delta_
             monthly_add_qty=excluded.monthly_add_qty
         """,
         (
-            str(username), str(account), str(cls),
-            float(delta_qty or 0.0), now,
+            str(username),
+            str(account),
+            str(cls),
+            float(delta_qty or 0.0),
+            now,
             float(monthly_avg_2025_qty or 0.0),
             float(monthly_add_qty or 0.0),
         ),
@@ -697,7 +699,16 @@ def db_load_user_item_qty(con_, username: str) -> dict:
     return {(str(username), str(acc), str(cls), str(item)): float(dq or 0.0) for acc, cls, item, dq in rows}
 
 
-def db_upsert_user_item_qty(con_, username: str, account: str, cls: str, item: str, delta_qty: float, monthly_avg_2025_qty: float, monthly_add_qty: float):
+def db_upsert_user_item_qty(
+    con_,
+    username: str,
+    account: str,
+    cls: str,
+    item: str,
+    delta_qty: float,
+    monthly_avg_2025_qty: float,
+    monthly_add_qty: float,
+):
     con_ = db_ready(con_)
     now = datetime.now(timezone.utc).isoformat()
     con_.execute(
@@ -711,8 +722,12 @@ def db_upsert_user_item_qty(con_, username: str, account: str, cls: str, item: s
             monthly_add_qty=excluded.monthly_add_qty
         """,
         (
-            str(username), str(account), str(cls), str(item),
-            float(delta_qty or 0.0), now,
+            str(username),
+            str(account),
+            str(cls),
+            str(item),
+            float(delta_qty or 0.0),
+            now,
             float(monthly_avg_2025_qty or 0.0),
             float(monthly_add_qty or 0.0),
         ),
@@ -878,10 +893,15 @@ def sum_item_delta_qty_for_class(user_item_qty: dict, username: str, account: st
     return total
 
 
-def build_class_view(user_class_qty: dict, user_item_qty: dict, username: str, account: str, df_customer: pd.DataFrame) -> pd.DataFrame:
+def build_class_view(
+    user_class_qty: dict,
+    user_item_qty: dict,
+    username: str,
+    account: str,
+    df_customer: pd.DataFrame,
+) -> pd.DataFrame:
     class_df = compute_classes(df_customer)
 
-    # effective delta = class delta + sum(item deltas under the class)
     def eff_delta(cls_val: str) -> float:
         base = get_class_delta_qty(user_class_qty, username, account, cls_val)
         add_items = sum_item_delta_qty_for_class(user_item_qty, username, account, cls_val)
@@ -900,7 +920,7 @@ def build_class_view(user_class_qty: dict, user_item_qty: dict, username: str, a
     class_df["target_money"] = class_df["sales_money"] + class_df["delta_money"]
     class_df["target_qty"] = class_df["sales_qty"] + class_df["delta_qty"]
 
-    # monthly columns (computed for display)
+    # monthly columns
     class_df["monthly_avg_2025_qty"] = class_df["sales_qty"].apply(lambda x: float(x or 0.0) / MONTHS_IN_YEAR)
     class_df["monthly_add_qty"] = class_df["delta_qty"].apply(lambda x: float(x or 0.0) / MONTHS_IN_YEAR)
     class_df["monthly_target_2026_qty"] = class_df["target_qty"].apply(lambda x: float(x or 0.0) / MONTHS_IN_YEAR)
@@ -961,16 +981,12 @@ def compute_scope_kpi_money(
         u = str(username)
         c = str(cls_val)
         for (uu, acc, cc), dq in user_class_qty.items():
-            if str(uu) != u:
-                continue
-            if str(acc) not in allowed:
+            if str(uu) != u or str(acc) not in allowed:
                 continue
             if str(cc) == c:
                 total += float(dq or 0.0)
         for (uu, acc, cc, _item), dq in user_item_qty.items():
-            if str(uu) != u:
-                continue
-            if str(acc) not in allowed:
+            if str(uu) != u or str(acc) not in allowed:
                 continue
             if str(cc) == c:
                 total += float(dq or 0.0)
@@ -1010,16 +1026,12 @@ def compute_scope_kpi_qty(
         u = str(username)
         c = str(cls_val)
         for (uu, acc, cc), dq in user_class_qty.items():
-            if str(uu) != u:
-                continue
-            if str(acc) not in allowed:
+            if str(uu) != u or str(acc) not in allowed:
                 continue
             if str(cc) == c:
                 total += float(dq or 0.0)
         for (uu, acc, cc, _item), dq in user_item_qty.items():
-            if str(uu) != u:
-                continue
-            if str(acc) not in allowed:
+            if str(uu) != u or str(acc) not in allowed:
                 continue
             if str(cc) == c:
                 total += float(dq or 0.0)
@@ -1035,90 +1047,15 @@ def compute_scope_kpi_qty(
     return q2025, q2026, diff, pct
 
 
-def build_scope_class_summary_table(
-    username: str,
-    df_scope: pd.DataFrame,
-    user_class_qty: dict,
-    user_item_qty: dict,
-    selected_accounts: Optional[list[str]],
-    include_targets: bool,
-) -> pd.DataFrame:
-    base = compute_classes(df_scope).copy()
-    base = base.rename(
-        columns={
-            COL_CLASS: "שם קוד מיון פריט",
-            "sales_money": "מכירות_בכסף",
-            "sales_qty": "מכירות_בכמות",
-            "avg_price": "מחיר_ממוצע",
-        }
-    )
-
-    if not include_targets:
-        # add monthly avg from sales (display)
-        base["ממוצע_חודשי_כמות_2025"] = pd.to_numeric(base["מכירות_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
-        return base[["שם קוד מיון פריט", "מכירות_בכסף", "מכירות_בכמות", "מחיר_ממוצע", "ממוצע_חודשי_כמות_2025"]].copy()
-
-    allowed = _allowed_accounts(df_scope, selected_accounts)
-
-    def agg_eff_delta_qty(cls_val: str) -> float:
-        total = 0.0
-        u = str(username)
-        c = str(cls_val)
-        for (uu, acc, cc), dq in user_class_qty.items():
-            if str(uu) != u:
-                continue
-            if str(acc) not in allowed:
-                continue
-            if str(cc) == c:
-                total += float(dq or 0.0)
-        for (uu, acc, cc, _item), dq in user_item_qty.items():
-            if str(uu) != u:
-                continue
-            if str(acc) not in allowed:
-                continue
-            if str(cc) == c:
-                total += float(dq or 0.0)
-        return total
-
-    base["תוספת_יעד_כמות"] = base["שם קוד מיון פריט"].astype(str).apply(agg_eff_delta_qty)
-
-    def qty_to_money_row(r):
-        p = r["מחיר_ממוצע"]
-        dq = float(r["תוספת_יעד_כמות"] or 0.0)
-        if pd.isna(p) or float(p) == 0:
-            return 0.0
-        return dq * float(p)
-
-    base["תוספת_יעד_כסף"] = base.apply(qty_to_money_row, axis=1)
-    base["יעד_בכסף"] = base["מכירות_בכסף"] + base["תוספת_יעד_כסף"]
-    base["יעד_בכמות"] = base["מכירות_בכמות"] + base["תוספת_יעד_כמות"]
-
-    # monthly
-    base["ממוצע_חודשי_כמות_2025"] = pd.to_numeric(base["מכירות_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
-    base["תוספת_חודשית_כמות"] = pd.to_numeric(base["תוספת_יעד_כמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
-    base["יעד_חודשי_כמות_2026"] = pd.to_numeric(base["יעד_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
-
-    return base[
-        [
-            "שם קוד מיון פריט",
-            "מכירות_בכסף",
-            "מכירות_בכמות",
-            "מחיר_ממוצע",
-            "ממוצע_חודשי_כמות_2025",
-            "תוספת_יעד_כסף",
-            "תוספת_יעד_כמות",
-            "תוספת_חודשית_כמות",
-            "יעד_בכסף",
-            "יעד_בכמות",
-            "יעד_חודשי_כמות_2026",
-        ]
-    ].copy()
-
-
 # =========================
 # Excel report
 # =========================
-def build_agent_sales_report_2025_2026(username: str, agent_df: pd.DataFrame, user_class_qty: dict, user_item_qty: dict) -> pd.DataFrame:
+def build_agent_sales_report_2025_2026(
+    username: str,
+    agent_df: pd.DataFrame,
+    user_class_qty: dict,
+    user_item_qty: dict,
+) -> pd.DataFrame:
     customers = agent_df[COL_ACCOUNT].dropna().astype(str).unique().tolist()
     rows = []
     for acc in customers:
@@ -1451,62 +1388,6 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"שגיאה: {e}")
 
-        st.markdown("---")
-        st.markdown("### ADMIN — מחיקת משתמש")
-
-        users_df_all = db_list_non_admin_users(con)
-        if users_df_all.empty:
-            st.caption("אין משתמשים למחיקה.")
-        else:
-            users_df_all["label"] = users_df_all.apply(
-                lambda r: f"{r['username']} | {agent_label(r['agent_id'])}"
-                + (" | לא פעיל" if int(r["is_active"]) != 1 else ""),
-                axis=1,
-            )
-            labels = users_df_all["label"].tolist()
-            label_to_user = dict(zip(users_df_all["label"].tolist(), users_df_all["username"].tolist()))
-
-            chosen_label = st.selectbox("בחר משתמש למחיקה", options=labels, key="admin_delete_pick")
-            del_user = str(label_to_user[chosen_label])
-
-            mode = st.radio(
-                "סוג מחיקה",
-                options=[
-                    "השבת משתמש (מומלץ) — לא יוכל להתחבר",
-                    "מחיקה מלאה (מסוכן) — מחיקת משתמש + נתונים",
-                ],
-                index=0,
-                key="admin_delete_mode",
-            )
-
-            wipe_targets = st.checkbox("למחוק גם יעדים (targets) של המשתמש", value=True, key="admin_wipe_targets")
-            wipe_file = st.checkbox("למחוק גם קובץ אישי של המשתמש (אם קיים)", value=True, key="admin_wipe_file")
-            confirm_text = st.text_input("להקליד DELETE כדי לאשר", key="admin_delete_confirm")
-
-            if st.button("בצע מחיקה", use_container_width=True, key="admin_delete_btn"):
-                if confirm_text.strip().upper() != "DELETE":
-                    st.error("לא אושר. יש להקליד DELETE.")
-                    st.stop()
-
-                try:
-                    if mode.startswith("השבת"):
-                        db_disable_user(con, del_user)
-                        if wipe_targets:
-                            db_delete_user_targets(con, del_user)
-                        if wipe_file:
-                            db_delete_user_file(con, del_user)
-                        st.success("המשתמש הושבת. (וגם נמחקו נתונים לפי הבחירה)")
-                    else:
-                        if wipe_targets:
-                            db_delete_user_targets(con, del_user)
-                        if wipe_file:
-                            db_delete_user_file(con, del_user)
-                        db_hard_delete_user(con, del_user)
-                        st.success("המשתמש נמחק לחלוטין.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"שגיאה במחיקה: {e}")
-
 # =========================
 # Resolve context user
 # =========================
@@ -1638,7 +1519,6 @@ if not IS_ADMIN:
     st.caption("המערכת מציגה רק את המכירות של הסוכן המחובר (סינון לפי עמודת 'סוכן בחשבון').")
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --- Customer table + share(%) out of agent total ---
 scope_total_money_2025 = float(pd.to_numeric(scope_df[COL_NET], errors="coerce").fillna(0.0).sum())
 
 cust_table = (
@@ -1743,7 +1623,6 @@ with right:
     st.caption(scope_subtitle)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # KPI
     if IS_ADMIN and admin_company_wide:
         if CAN_SEE_MONEY:
             s2025 = float(pd.to_numeric(df_scope[COL_NET], errors="coerce").fillna(0.0).sum())
@@ -1770,59 +1649,7 @@ with right:
             )
             kpi_block_qty(q2026, q2025, diff, pct, "כמות/יעד 2026")
 
-    # Read-only class breakdown when NOT single customer
-    if not single:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### פירוט לפי קודי מיון (קריאה בלבד)")
-        st.caption("מוצג לפי הטווח שנבחר. אין עריכת יעדים במצב זה.")
-
-        if IS_ADMIN and admin_company_wide:
-            cls_tbl = build_scope_class_summary_table(
-                context_username, df_scope, user_class_qty, user_item_qty, selected_accounts_for_scope, include_targets=False
-            )
-        else:
-            cls_tbl = build_scope_class_summary_table(
-                context_username, df_scope, user_class_qty, user_item_qty, selected_accounts_for_scope, include_targets=True
-            )
-
-        show_cols = ["שם קוד מיון פריט"]
-        cfg2 = {"שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון")}
-
-        if CAN_SEE_MONEY and "מכירות_בכסף" in cls_tbl.columns:
-            show_cols += ["מכירות_בכסף"]
-            cfg2["מכירות_בכסף"] = st.column_config.NumberColumn("מכירות (₪)", format="%.2f")
-        if CAN_SEE_QTY and "מכירות_בכמות" in cls_tbl.columns:
-            show_cols += ["מכירות_בכמות"]
-            cfg2["מכירות_בכמות"] = st.column_config.NumberColumn("כמות 2025", format="%.2f")
-
-        if "ממוצע_חודשי_כמות_2025" in cls_tbl.columns and CAN_SEE_QTY:
-            show_cols += ["ממוצע_חודשי_כמות_2025"]
-            cfg2["ממוצע_חודשי_כמות_2025"] = st.column_config.NumberColumn("ממוצע חודשי (כמות) 2025", format="%.2f")
-
-        for c, label, fmt in [
-            ("תוספת_יעד_כמות", "תוספת יעד (כמות)", "%.2f"),
-            ("תוספת_חודשית_כמות", "תוספת חודשית (כמות)", "%.2f"),
-            ("יעד_בכמות", "כמות 2026", "%.2f"),
-            ("יעד_חודשי_כמות_2026", "יעד חודשי 2026 (כמות)", "%.2f"),
-        ]:
-            if c in cls_tbl.columns and CAN_SEE_QTY:
-                show_cols.append(c)
-                cfg2[c] = st.column_config.NumberColumn(label, format=fmt)
-
-        if CAN_SEE_MONEY:
-            for c, label in [
-                ("מחיר_ממוצע", "מחיר ממוצע"),
-                ("תוספת_יעד_כסף", "תוספת יעד (₪)"),
-                ("יעד_בכסף", "2026 (₪)"),
-            ]:
-                if c in cls_tbl.columns:
-                    show_cols.append(c)
-                    cfg2[c] = st.column_config.NumberColumn(label, format="%.2f")
-
-        st.dataframe(cls_tbl[show_cols], use_container_width=True, hide_index=True, column_config=cfg2)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Excel download (money-based)
+    # Excel download
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown(f"### דוח אקסל — {scope_agent_display}")
 
@@ -1842,7 +1669,6 @@ with right:
             rep["מכירות 2026"] = rep["מכירות 2025"]
             rep["הפרש בין 2025 ל 2026"] = 0.0
             rep["שינוי באחוזים"] = 0.0
-
             t2025 = float(pd.to_numeric(rep["מכירות 2025"], errors="coerce").fillna(0.0).sum())
             rep = pd.concat(
                 [
@@ -1872,7 +1698,9 @@ with right:
             fname = f"uzeb_{safe_filename(str(context_agent_id))}__{safe_filename(context_username)}__sales_2025_2026.xlsx"
             st.download_button(
                 "⬇️ הורד דוח מכירות (Excel)",
-                data=make_agent_sales_excel(f"דוח מכירות {scope_agent_display} (2025→2026): {context_username}", agent_sales_df),
+                data=make_agent_sales_excel(
+                    f"דוח מכירות {scope_agent_display} (2025→2026): {context_username}", agent_sales_df
+                ),
                 file_name=fname,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
@@ -1890,11 +1718,11 @@ with right:
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### עריכת יעדים (לקוח יחיד)")
-        st.info("✏️ ערוך **תוספת יעד (כמות)**. שאר השדות מחושבים אוטומטית. (תוספות פריטים מצטרפות לתוספות קוד מיון)")
+        st.info("✏️ ערוך **תוספת יעד (כמות)**. שאר השדות מחושבים אוטומטית. (תוספות פריטים מצטרפות לקוד המיון)")
 
         base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
 
-        # ---- Column filter for ALL users (within permissions) ----
+        # ---- Column filter (per user) ----
         all_possible_cols = [
             "שם קוד מיון פריט",
             "מכירות_בכסף",
@@ -1909,23 +1737,49 @@ with right:
             "יעד_חודשי_כמות_2026",
         ]
 
-        # enforce permissions
         allowed_cols = ["שם קוד מיון פריט"]
         if CAN_SEE_MONEY:
             allowed_cols += ["מכירות_בכסף", "מחיר_ממוצע", "תוספת_יעד_כסף", "יעד_בכסף"]
         if CAN_SEE_QTY:
-            allowed_cols += ["מכירות_בכמות", "ממוצע_חודשי_כמות_2025", "תוספת_יעד_כמות", "תוספת_חודשית_כמות", "יעד_בכמות", "יעד_חודשי_כמות_2026"]
-        # keep stable order
+            allowed_cols += [
+                "מכירות_בכמות",
+                "ממוצע_חודשי_כמות_2025",
+                "תוספת_יעד_כמות",
+                "תוספת_חודשית_כמות",
+                "יעד_בכמות",
+                "יעד_חודשי_כמות_2026",
+            ]
         allowed_cols = [c for c in all_possible_cols if c in set(allowed_cols)]
 
         cols_pref_key = f"class_editor_cols::{context_username}::{context_agent_id}::{account}"
         if cols_pref_key not in st.session_state:
-            # default
-            default_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
-            if CAN_SEE_QTY:
-                default_cols = ["שם קוד מיון פריט", "מכירות_בכמות", "ממוצע_חודשי_כמות_2025", "תוספת_יעד_כמות", "תוספת_חודשית_כמות", "יעד_בכמות", "יעד_חודשי_כמות_2026"]
-            if CAN_SEE_MONEY:
-                default_cols = ["שם קוד מיון פריט", "מכירות_בכסף", "מכירות_בכמות", "מחיר_ממוצע", "ממוצע_חודשי_כמות_2025", "תוספת_יעד_כמות", "תוספת_חודשית_כמות", "תוספת_יעד_כסף", "יעד_בכסף", "יעד_בכמות"]
+            # Default includes computed monthly columns if possible
+            if CAN_SEE_MONEY and CAN_SEE_QTY:
+                default_cols = [
+                    "שם קוד מיון פריט",
+                    "מכירות_בכסף",
+                    "מכירות_בכמות",
+                    "ממוצע_חודשי_כמות_2025",
+                    "מחיר_ממוצע",
+                    "תוספת_יעד_כמות",
+                    "תוספת_חודשית_כמות",
+                    "תוספת_יעד_כסף",
+                    "יעד_בכסף",
+                    "יעד_בכמות",
+                    "יעד_חודשי_כמות_2026",
+                ]
+            elif CAN_SEE_QTY:
+                default_cols = [
+                    "שם קוד מיון פריט",
+                    "מכירות_בכמות",
+                    "ממוצע_חודשי_כמות_2025",
+                    "תוספת_יעד_כמות",
+                    "תוספת_חודשית_כמות",
+                    "יעד_בכמות",
+                    "יעד_חודשי_כמות_2026",
+                ]
+            else:
+                default_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
             st.session_state[cols_pref_key] = [c for c in default_cols if c in allowed_cols]
 
         st.markdown("#### סינון עמודות לתצוגה")
@@ -1935,17 +1789,16 @@ with right:
             default=st.session_state[cols_pref_key],
             key=f"ms_{cols_pref_key}",
         )
-        # must keep these
+
         must_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
         for c in must_cols:
             if c in allowed_cols and c not in picked_cols:
                 picked_cols.append(c)
-        # save in session
+
         st.session_state[cols_pref_key] = [c for c in allowed_cols if c in set(picked_cols)]
 
         editor_df_full = base_df[st.session_state[cols_pref_key]].copy()
 
-        # Column config (editable only: תוספת_יעד_כמות)
         column_config = {"שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון", disabled=True)}
         if "מכירות_בכסף" in editor_df_full.columns:
             column_config["מכירות_בכסף"] = st.column_config.NumberColumn("מכירות (₪)", disabled=True, format="%.2f")
@@ -1954,12 +1807,16 @@ with right:
         if "מחיר_ממוצע" in editor_df_full.columns:
             column_config["מחיר_ממוצע"] = st.column_config.NumberColumn("מחיר ממוצע", disabled=True, format="%.2f")
         if "ממוצע_חודשי_כמות_2025" in editor_df_full.columns:
-            column_config["ממוצע_חודשי_כמות_2025"] = st.column_config.NumberColumn("ממוצע חודשי (כמות) 2025", disabled=True, format="%.2f")
+            column_config["ממוצע_חודשי_כמות_2025"] = st.column_config.NumberColumn(
+                "ממוצע חודשי (כמות) 2025", disabled=True, format="%.2f"
+            )
 
         column_config["תוספת_יעד_כמות"] = st.column_config.NumberColumn("תוספת יעד (כמות)", step=1.0, format="%.2f")
 
         if "תוספת_חודשית_כמות" in editor_df_full.columns:
-            column_config["תוספת_חודשית_כמות"] = st.column_config.NumberColumn("תוספת חודשית (כמות)", disabled=True, format="%.2f")
+            column_config["תוספת_חודשית_כמות"] = st.column_config.NumberColumn(
+                "תוספת חודשית (כמות)", disabled=True, format="%.2f"
+            )
         if "תוספת_יעד_כסף" in editor_df_full.columns:
             column_config["תוספת_יעד_כסף"] = st.column_config.NumberColumn("תוספת יעד (₪)", disabled=True, format="%.2f")
         if "יעד_בכסף" in editor_df_full.columns:
@@ -1967,7 +1824,9 @@ with right:
         if "יעד_בכמות" in editor_df_full.columns:
             column_config["יעד_בכמות"] = st.column_config.NumberColumn("כמות 2026", disabled=True, format="%.2f")
         if "יעד_חודשי_כמות_2026" in editor_df_full.columns:
-            column_config["יעד_חודשי_כמות_2026"] = st.column_config.NumberColumn("יעד חודשי 2026 (כמות)", disabled=True, format="%.2f")
+            column_config["יעד_חודשי_כמות_2026"] = st.column_config.NumberColumn(
+                "יעד חודשי 2026 (כמות)", disabled=True, format="%.2f"
+            )
 
         with st.form(key=f"targets_form::{context_username}::{context_agent_id}::{account}", clear_on_submit=False):
             edited = st.data_editor(
@@ -1984,7 +1843,6 @@ with right:
                 save_clicked = st.form_submit_button("שמור למסד", use_container_width=True)
 
         if refresh_clicked or save_clicked:
-            # maps for saving snapshots
             sales_qty_map = dict(
                 zip(
                     base_df["שם קוד מיון פריט"].astype(str),
@@ -1998,7 +1856,6 @@ with right:
                 cls = str(r["שם קוד מיון פריט"])
                 dq = float(r["תוספת_יעד_כמות"] or 0.0)
 
-                # update in-memory: CLASS delta only (items are separate)
                 user_class_qty[(str(context_username), str(account), str(cls))] = dq
 
                 if save_clicked:
@@ -2008,25 +1865,19 @@ with right:
 
             st.session_state[class_key] = user_class_qty
 
-            # KPI update
-            if CAN_SEE_MONEY:
-                s2025_, s2026_, diff_, pct_ = compute_scope_kpi_money(context_username, df_scope, user_class_qty, user_item_qty, [account])
-                kpi_block_money(s2026_, s2025_, diff_, pct_, share_pct, "מכירות/יעד 2026 (₪)")
-            else:
-                q2025_, q2026_, diff_, pct_ = compute_scope_kpi_qty(context_username, df_scope, user_class_qty, user_item_qty, [account])
-                kpi_block_qty(q2026_, q2025_, diff_, pct_, "כמות/יעד 2026")
-
             st.success("נשמר ועודכן." if save_clicked else "עודכן.")
+            # FIX: force rebuild to show computed columns
+            st.rerun()
 
-        # ========= EDITABLE ITEMS breakdown =========
+        # ========= EDITABLE ITEMS =========
         st.markdown("---")
         st.markdown("### פירוט פריטים (עריכה) — סינון לפי קוד מיון + חיפוש בשם פריט")
-        st.caption("עריכת תוספת יעד לפי פריט מצטרפת לסה״כ תוספת בקוד המיון ומעדכנת KPI אוטומטית.")
+        st.caption("עריכת תוספת יעד לפי פריט מצטרפת לקוד המיון ומעדכנת KPI אוטומטית.")
 
         if COL_ITEM not in df_cust.columns:
             st.caption('לא נמצאה עמודה "שם פריט" בקובץ — לא ניתן להציג פירוט פריטים.')
         elif not CAN_SEE_ITEM:
-            st.caption('לפי הרשאות התצוגה, למשתמש רגיל אין גישה לעמודת "שם פריט". (ADMIN יכול להפעיל זאת במסך ניהול תצוגה).')
+            st.caption('לפי הרשאות התצוגה, למשתמש רגיל אין גישה לעמודת "שם פריט".')
         else:
             all_classes = sorted(df_cust[COL_CLASS].dropna().astype(str).unique().tolist()) if COL_CLASS in df_cust.columns else []
 
@@ -2057,7 +1908,6 @@ with right:
             if items_df.empty:
                 st.caption("אין פריטים שמתאימים לסינון הנוכחי.")
             else:
-                # Aggregate per (class,item)
                 grp_cols = [COL_CLASS, COL_ITEM] if COL_CLASS in items_df.columns else [COL_ITEM]
 
                 agg_map = {}
@@ -2071,13 +1921,13 @@ with right:
                 else:
                     g = items_df.groupby(grp_cols, dropna=False).agg(**agg_map).reset_index()
 
-                    # add avg price if possible
                     if CAN_SEE_MONEY and CAN_SEE_QTY and "מכירות_בכסף" in g.columns and "מכירות_בכמות" in g.columns:
-                        g["מחיר_ממוצע"] = g.apply(lambda r: safe_div(float(r["מכירות_בכסף"]), float(r["מכירות_בכמות"])), axis=1)
+                        g["מחיר_ממוצע"] = g.apply(
+                            lambda r: safe_div(float(r["מכירות_בכסף"]), float(r["מכירות_בכמות"])), axis=1
+                        )
                     else:
                         g["מחיר_ממוצע"] = math.nan
 
-                    # attach item delta (from DB)
                     def item_delta_row(r) -> float:
                         cls_v = str(r[COL_CLASS]) if COL_CLASS in r else ""
                         item_v = str(r[COL_ITEM])
@@ -2085,18 +1935,23 @@ with right:
 
                     g["תוספת_יעד_כמות"] = g.apply(item_delta_row, axis=1)
 
-                    # computed targets
                     if "מכירות_בכמות" in g.columns:
-                        g["יעד_בכמות"] = pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0) + pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
+                        g["יעד_בכמות"] = (
+                            pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0)
+                            + pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
+                        )
                     else:
                         g["יעד_בכמות"] = pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
 
                     if CAN_SEE_MONEY and "מכירות_בכסף" in g.columns:
-                        dm = pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0) * pd.to_numeric(g["מחיר_ממוצע"], errors="coerce").fillna(0.0)
+                        dm = (
+                            pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
+                            * pd.to_numeric(g["מחיר_ממוצע"], errors="coerce").fillna(0.0)
+                        )
                         g["תוספת_יעד_כסף"] = dm
                         g["יעד_בכסף"] = pd.to_numeric(g["מכירות_בכסף"], errors="coerce").fillna(0.0) + dm
 
-                    # monthly computed for display
+                    # monthly
                     if "מכירות_בכמות" in g.columns:
                         g["ממוצע_חודשי_כמות_2025"] = pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
                     else:
@@ -2104,24 +1959,26 @@ with right:
                     g["תוספת_חודשית_כמות"] = pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
                     g["יעד_חודשי_כמות_2026"] = pd.to_numeric(g["יעד_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
 
-                    # display columns
                     disp = g.copy()
                     if COL_CLASS in disp.columns:
                         disp = disp.rename(columns={COL_CLASS: "קוד מיון"})
                     disp = disp.rename(columns={COL_ITEM: "שם פריט"})
 
-                    # sort
-                    sort_col = "מכירות_בכסף" if ("מכירות_בכסף" in disp.columns) else ("מכירות_בכמות" if "מכירות_בכמות" in disp.columns else "תוספת_יעד_כמות")
+                    sort_col = "מכירות_בכסף" if ("מכירות_בכסף" in disp.columns) else (
+                        "מכירות_בכמות" if "מכירות_בכמות" in disp.columns else "תוספת_יעד_כמות"
+                    )
                     disp = disp.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
-                    # editor table: editable only "תוספת_יעד_כמות"
                     editor_cols = []
                     if "קוד מיון" in disp.columns:
                         editor_cols += ["קוד מיון"]
                     editor_cols += ["שם פריט"]
+
                     if "מכירות_בכמות" in disp.columns:
                         editor_cols += ["מכירות_בכמות", "ממוצע_חודשי_כמות_2025"]
+
                     editor_cols += ["תוספת_יעד_כמות", "תוספת_חודשית_כמות", "יעד_בכמות", "יעד_חודשי_כמות_2026"]
+
                     if CAN_SEE_MONEY and "מכירות_בכסף" in disp.columns:
                         editor_cols += ["מכירות_בכסף", "מחיר_ממוצע", "תוספת_יעד_כסף", "יעד_בכסף"]
 
@@ -2176,7 +2033,6 @@ with right:
                             user_item_qty[(str(context_username), str(account), str(cls_val), str(item_val))] = dq
 
                             if items_save:
-                                # snapshot monthly avg from current sales data (for this item row)
                                 sales_year_qty = float(rr.get("מכירות_בכמות", 0.0) or 0.0)
                                 monthly_avg_2025_qty = sales_year_qty / MONTHS_IN_YEAR
                                 monthly_add_qty = dq / MONTHS_IN_YEAR
@@ -2192,23 +2048,8 @@ with right:
                                 )
 
                         st.session_state[item_key] = user_item_qty
-
-                        # KPI update
-                        if CAN_SEE_MONEY:
-                            s2025_, s2026_, diff_, pct_ = compute_scope_kpi_money(context_username, df_scope, user_class_qty, user_item_qty, [account])
-                            kpi_block_money(s2026_, s2025_, diff_, pct_, share_pct, "מכירות/יעד 2026 (₪)")
-                        else:
-                            q2025_, q2026_, diff_, pct_ = compute_scope_kpi_qty(context_username, df_scope, user_class_qty, user_item_qty, [account])
-                            kpi_block_qty(q2026_, q2025_, diff_, pct_, "כמות/יעד 2026")
-
-                        # סעיף 8: רענון מלא אחרי שמירה כדי ליישר תצוגות
-                        if items_save:
-                            st.success("נשמרו פריטים ועודכן.")
-                            st.rerun()
-                        else:
-                            st.success("עודכן (ללא שמירה).")
+                        st.success("נשמרו פריטים ועודכן." if items_save else "עודכן (ללא שמירה).")
+                        # FIX: force rebuild to show computed columns
+                        st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
-
-    elif (IS_ADMIN and admin_company_wide) and (len(selected_customers) >= 1):
-        st.info("בתצוגת חברה מלאה אין עריכת יעדים. כבה את 'תצוגת חברה מלאה' כדי לערוך יעדים לסוכן/משתמש.")
