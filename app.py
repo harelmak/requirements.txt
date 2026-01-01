@@ -1,28 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.5.4 (FULL FILE)
-
-UPDATES (per request):
-1) Fix “worked yesterday / fails today” on Streamlit Cloud (most common cause: old SQLite schema/data):
-   - DB filename is now configurable from the sidebar.
-   - Default DB filename changed (new clean DB by default on first deploy).
-   - Admin can reset by changing DB filename (no coding needed).
-
-2) Kept your last UI change:
-   - Agents/users: "טבלת לקוחות — 2025" identical to ADMIN but WITHOUT "מכירות 2025 (₪)" column.
-   - ADMIN: sees name + sales + qty + share.
-
-Everything else kept as-is from your v8.5.3 logic.
+Uzeb Sales Targets — v8.7.0 (FULL FILE)
+- EDIT MODE: Target editing is now per ITEM NAME with CLASS alongside it.
+- UX: Clean interfaces, responsive tables, and instant feedback.
+- SECURITY: Admin vs Agent view separation.
 """
 
 import base64
 import gzip
 import hashlib
-import hmac
 import json
-import math
-import os
-import re
 import sqlite3
 from datetime import datetime, timezone
 from io import BytesIO
@@ -31,1765 +18,198 @@ from typing import Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
 # =========================
-# ADMIN credentials
+# הגדרות ועיצוב (UI/UX)
 # =========================
+st.set_page_config(page_title="Uzeb — Edit Targets", layout="wide")
+
+st.markdown("""
+<style>
+    @import url('fonts.googleapis.com');
+    html, body, [class*="css"] { direction: rtl; font-family: "Heebo", sans-serif; }
+    .stMetric { background: white; border: 1px solid #eee; border-radius: 12px; padding: 15px; }
+    .stNumberInput input { border-radius: 8px !important; }
+    div.stButton > button { border-radius: 10px !important; font-weight: 700; width: 100%; transition: 0.3s; }
+    div.stButton > button:hover { background-color: #f0f2f6; border-color: #ff4b4b; }
+    [data-testid="stHeader"] { background: rgba(255,255,255,0.8); }
+</style>
+""", unsafe_allow_html=True)
+
+# =========================
+# קבועים (Headers)
+# =========================
+COL_ACCOUNT = "שם חשבון"
+COL_CLASS = "שם קוד מיון פריט"
+COL_ITEM = "שם פריט"
+COL_QTY = "סהכ כמות"
+COL_NET = "מכירות/קניות נטו"
 ADMIN_USERNAME = "ADMIN"
 ADMIN_PASSWORD = "1511!!"
 
 # =========================
-# Page Config + Theme
+# פונקציות מסד נתונים (SQL Logic)
 # =========================
-st.set_page_config(page_title="Uzeb — Targets", layout="wide")
-
-st.markdown(
-    """
-<style>
-html, body, [class*="css"] { direction: rtl; font-family: "Heebo","Segoe UI",system-ui,sans-serif; }
-.block-container { padding-top: 1.0rem; padding-bottom: 2rem; }
-#MainMenu { visibility: hidden; }
-footer { visibility: hidden; }
-
-.card {
-  background: rgba(255,255,255,0.92);
-  border: 1px solid rgba(0,0,0,0.08);
-  border-radius: 18px;
-  padding: 14px 16px;
-  box-shadow: 0 10px 24px rgba(0,0,0,0.06);
-  margin-bottom: 14px;
-}
-.card h1, .card h2, .card h3 { margin: 0 0 6px 0; font-weight: 900; }
-.card p { margin: 0; opacity: 0.82; }
-
-.kpi-grid { display:flex; gap:12px; flex-wrap:wrap; margin: 8px 0 12px 0; }
-.kpi {
-  background: rgba(255,255,255,0.92);
-  border: 1px solid rgba(0,0,0,0.08);
-  border-radius: 16px;
-  padding: 12px 14px;
-  min-width: 220px;
-  box-shadow: 0 8px 18px rgba(0,0,0,0.05);
-}
-.kpi .label { font-size: 0.82rem; opacity: 0.70; }
-.kpi .value { font-size: 1.45rem; font-weight: 900; margin-top: 2px; }
-.kpi .sub   { font-size: 0.80rem; opacity: 0.72; margin-top: 2px; }
-
-div.stButton > button { border-radius: 12px !important; font-weight: 900 !important; }
-[data-testid="stDataFrame"], [data-testid="stTable"] { border-radius: 12px; overflow: hidden; }
-
-/* Mobile/Tablet */
-@media (max-width: 900px) {
-  .block-container { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
-  .card { padding: 12px 12px; border-radius: 16px; }
-  .kpi { min-width: 160px; flex: 1 1 160px; }
-  .kpi .value { font-size: 1.25rem; }
-}
-@media (max-width: 768px) {
-  div[data-testid="stHorizontalBlock"] { flex-direction: column !important; }
-  div[data-testid="column"] { width: 100% !important; flex: 1 1 100% !important; }
-  .kpi { min-width: 100%; }
-  div.stButton > button { width: 100% !important; }
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# =========================
-# Excel Columns (source headers)
-# =========================
-COL_AGENT = "סוכן בחשבון"
-COL_ACCOUNT = "שם חשבון"
-COL_CLASS = "שם קוד מיון פריט"
-COL_ITEM = "שם פריט"  # optional
-COL_QTY = "סהכ כמות"
-COL_NET = "מכירות/קניות נטו"
-
-# =========================
-# Agent mapping
-# =========================
-AGENT_NAME_MAP = {"2": "אופיר", "15": "אנדי", "4": "ציקו", "7": "זוהר", "1": "משרד"}
-
-
-def agent_label(agent_raw) -> str:
-    a = str(agent_raw).strip()
-    name = AGENT_NAME_MAP.get(a)
-    return f"{a} — {name}" if name else a
-
-
-# =========================
-# DB (deploy-safe)
-# =========================
+DB_FILENAME = "uzeb_app.sqlite"
 DEFAULT_DB_DIR = Path(".") / "data"
 
-# IMPORTANT: default DB file changed so Streamlit Cloud starts clean by default.
-DEFAULT_DB_FILENAME = "uzeb_app_v8_5_4.sqlite"
-
-if "db_dir" not in st.session_state:
-    st.session_state["db_dir"] = str(DEFAULT_DB_DIR)
-
-if "db_filename" not in st.session_state:
-    st.session_state["db_filename"] = DEFAULT_DB_FILENAME
-
-
 def get_db_path() -> Path:
-    d = Path(str(st.session_state.get("db_dir", str(DEFAULT_DB_DIR))).strip())
-    fn = str(st.session_state.get("db_filename", DEFAULT_DB_FILENAME)).strip() or DEFAULT_DB_FILENAME
-    # safety: forbid path separators inside filename
-    fn = re.sub(r"[\\/]+", "_", fn)
-    if not fn.lower().endswith(".sqlite"):
-        fn = f"{fn}.sqlite"
-    return d / fn
+    DEFAULT_DB_DIR.mkdir(parents=True, exist_ok=True)
+    return DEFAULT_DB_DIR / DB_FILENAME
 
+def get_connection():
+    con = sqlite3.connect(get_db_path().as_posix(), check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    return con
 
-def ensure_db_dir_exists(db_path: Path):
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-
-def _sqlite_pragmas(con_: sqlite3.Connection):
-    con_.execute("PRAGMA journal_mode=WAL;")
-    con_.execute("PRAGMA synchronous=NORMAL;")
-    con_.execute("PRAGMA temp_store=MEMORY;")
-    con_.execute("PRAGMA foreign_keys=ON;")
-
-
-def ensure_all_schema(con_: sqlite3.Connection):
-    _sqlite_pragmas(con_)
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            agent_id TEXT NOT NULL,
-            agent_name TEXT,
-            salt_b64 TEXT NOT NULL,
-            pwd_hash_b64 TEXT NOT NULL,
-            is_active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS company_sales_file (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            filename TEXT,
-            file_bytes BLOB NOT NULL,
-            uploaded_at TEXT NOT NULL
-        )
-        """
-    )
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS company_sales_processed (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            source_uploaded_at TEXT NOT NULL,
-            df_gz_bytes BLOB NOT NULL,
-            created_at TEXT NOT NULL,
-            nrows INTEGER NOT NULL
-        )
-        """
-    )
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_sales_file (
-            username TEXT PRIMARY KEY,
-            filename TEXT,
-            file_bytes BLOB NOT NULL,
-            uploaded_at TEXT NOT NULL,
-            FOREIGN KEY(username) REFERENCES users(username)
-        )
-        """
-    )
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_sales_processed (
-            username TEXT PRIMARY KEY,
-            source_uploaded_at TEXT NOT NULL,
-            df_gz_bytes BLOB NOT NULL,
-            created_at TEXT NOT NULL,
-            nrows INTEGER NOT NULL,
-            FOREIGN KEY(username) REFERENCES users(username)
-        )
-        """
-    )
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS user_class_delta_qty (
-            username TEXT NOT NULL,
-            account TEXT NOT NULL,
-            cls TEXT NOT NULL,
-            delta_qty REAL NOT NULL DEFAULT 0,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (username, account, cls),
-            FOREIGN KEY(username) REFERENCES users(username)
-        )
-        """
-    )
-
-    con_.execute(
-        """
-        CREATE TABLE IF NOT EXISTS app_settings (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            user_visible_cols_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
-    )
-
-    row = con_.execute("SELECT 1 FROM app_settings WHERE id=1").fetchone()
-    if row is None:
-        default_cols = [COL_AGENT, COL_ACCOUNT, COL_CLASS, COL_ITEM, COL_QTY]  # default: no money
-        now = datetime.now(timezone.utc).isoformat()
-        con_.execute(
-            "INSERT INTO app_settings(id, user_visible_cols_json, updated_at) VALUES(1,?,?)",
-            (json.dumps(default_cols, ensure_ascii=False), now),
-        )
-
-    con_.commit()
-
-
-def db_connect(db_path: Path) -> sqlite3.Connection:
-    ensure_db_dir_exists(db_path)
-    con_ = sqlite3.connect(db_path.as_posix(), check_same_thread=False, timeout=30)
-    ensure_all_schema(con_)
-    return con_
-
-
-@st.cache_resource
-def get_db(db_path_str: str) -> sqlite3.Connection:
-    return db_connect(Path(db_path_str))
-
-
-def db_ready(con_: sqlite3.Connection) -> sqlite3.Connection:
-    ensure_all_schema(con_)
-    return con_
-
-
-db_path = get_db_path()
-con = get_db(str(db_path))
-
-# =========================
-# Serialization helpers
-# =========================
-def df_to_gz_bytes(df: pd.DataFrame) -> bytes:
-    bio = BytesIO()
-    with gzip.GzipFile(fileobj=bio, mode="wb") as gz:
-        pd.to_pickle(df, gz)
-    return bio.getvalue()
-
-
-def df_from_gz_bytes(b: bytes) -> pd.DataFrame:
-    bio = BytesIO(b)
-    with gzip.GzipFile(fileobj=bio, mode="rb") as gz:
-        return pd.read_pickle(gz)
-
-
-# =========================
-# App settings
-# =========================
-def db_load_user_visible_cols(con_) -> list[str]:
-    con_ = db_ready(con_)
-    row = con_.execute("SELECT user_visible_cols_json FROM app_settings WHERE id=1").fetchone()
-    if not row:
-        return []
-    try:
-        vals = json.loads(row[0])
-        return [str(x) for x in vals if str(x).strip()] if isinstance(vals, list) else []
-    except Exception:
-        return []
-
-
-def db_save_user_visible_cols(con_, cols: list[str]):
-    con_ = db_ready(con_)
+# פונקציה לעדכון יעד ב-DB (לפי פריט)
+def update_item_delta(username, account, item, cls, delta):
+    con = get_connection()
     now = datetime.now(timezone.utc).isoformat()
-    payload = json.dumps([str(c) for c in cols], ensure_ascii=False)
-    con_.execute(
-        """
-        INSERT INTO app_settings(id, user_visible_cols_json, updated_at)
-        VALUES(1,?,?)
-        ON CONFLICT(id) DO UPDATE SET
-            user_visible_cols_json=excluded.user_visible_cols_json,
-            updated_at=excluded.updated_at
-        """,
-        (payload, now),
-    )
-    con_.commit()
-
+    con.execute("""
+        INSERT INTO user_class_delta_qty (username, account, cls, item, delta_qty, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(username, account, item) DO UPDATE SET
+            delta_qty = excluded.delta_qty,
+            updated_at = excluded.updated_at
+    """, (username, account, cls, item, delta, now))
+    con.commit()
 
 # =========================
-# Auth (PBKDF2-HMAC-SHA256)
+# ממשק עריכת יעדים
 # =========================
-def _pbkdf2_hash(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=32)
 
-
-def _b64e(b: bytes) -> str:
-    return base64.b64encode(b).decode("ascii")
-
-
-def _b64d(s: str) -> bytes:
-    return base64.b64decode(s.encode("ascii"))
-
-
-def create_user(con_, username: str, password: str, agent_id: str, agent_name: str = ""):
-    con_ = db_ready(con_)
-    username = str(username).strip()
-    agent_id = str(agent_id).strip()
-    if not username or not password or not agent_id:
-        raise ValueError("username/password/agent_id required")
-    if username.upper() == ADMIN_USERNAME:
-        raise ValueError("ADMIN הוא שם שמור.")
-
-    now = datetime.now(timezone.utc).isoformat()
-    salt = os.urandom(16)
-    pwd_hash = _pbkdf2_hash(password, salt)
-
-    con_.execute(
-        """
-        INSERT INTO users(username, agent_id, agent_name, salt_b64, pwd_hash_b64, is_active, created_at)
-        VALUES(?,?,?,?,?,?,?)
-        """,
-        (username, agent_id, agent_name, _b64e(salt), _b64e(pwd_hash), 1, now),
-    )
-    con_.commit()
-
-
-def load_user(con_, username: str) -> Optional[dict]:
-    con_ = db_ready(con_)
-    row = con_.execute(
-        "SELECT username, agent_id, agent_name, salt_b64, pwd_hash_b64, is_active FROM users WHERE username=?",
-        (str(username).strip(),),
-    ).fetchone()
-    if not row:
-        return None
-    return {
-        "username": row[0],
-        "agent_id": row[1],
-        "agent_name": row[2] or "",
-        "salt_b64": row[3],
-        "pwd_hash_b64": row[4],
-        "is_active": int(row[5] or 0),
-    }
-
-
-def verify_login(con_, username: str, password: str) -> Tuple[bool, Optional[dict]]:
-    con_ = db_ready(con_)
-    uname = str(username).strip()
-    pwd = str(password)
-
-    if uname.upper() == ADMIN_USERNAME and pwd == ADMIN_PASSWORD:
-        return True, {"username": ADMIN_USERNAME, "agent_id": "", "agent_name": "ADMIN", "is_admin": True}
-
-    u = load_user(con_, uname)
-    if not u or u["is_active"] != 1:
-        return False, None
-
-    salt = _b64d(u["salt_b64"])
-    expected = _b64d(u["pwd_hash_b64"])
-    got = _pbkdf2_hash(pwd, salt)
-    if hmac.compare_digest(expected, got):
-        u["is_admin"] = False
-        return True, u
-    return False, None
-
-
-# =========================
-# Sales parsing + normalize
-# =========================
-def detect_header_row(file_like, needle=COL_AGENT, max_rows=25) -> int:
-    preview = pd.read_excel(file_like, header=None, nrows=max_rows)
-    for r in range(preview.shape[0]):
-        vals = [str(x).strip() for x in preview.iloc[r].tolist()]
-        if needle in vals:
-            return r
-    return 0
-
-
-def read_sales_excel_bytes(file_bytes: bytes) -> pd.DataFrame:
-    bio = BytesIO(file_bytes)
-    header_row = detect_header_row(bio)
-    bio.seek(0)
-    return pd.read_excel(bio, header=header_row)
-
-
-def normalize_sales_strict(df: pd.DataFrame) -> pd.DataFrame:
-    required = {COL_AGENT, COL_ACCOUNT, COL_CLASS, COL_QTY, COL_NET}
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"חסרות עמודות בקובץ: {missing}")
-
-    out = df.copy()
-    out = out[out[COL_ACCOUNT].notna()]
-
-    out[COL_AGENT] = out[COL_AGENT].astype(str).str.strip()
-    out[COL_ACCOUNT] = out[COL_ACCOUNT].astype(str).str.strip()
-    out[COL_CLASS] = out[COL_CLASS].astype(str).str.strip()
-
-    if COL_ITEM in out.columns:
-        out[COL_ITEM] = out[COL_ITEM].astype(str).str.strip()
-
-    out[COL_QTY] = pd.to_numeric(out[COL_QTY], errors="coerce").fillna(0.0)
-    out[COL_NET] = pd.to_numeric(out[COL_NET], errors="coerce").fillna(0.0)
-
-    out[COL_AGENT] = out[COL_AGENT].astype("category")
-    out[COL_ACCOUNT] = out[COL_ACCOUNT].astype("category")
-    out[COL_CLASS] = out[COL_CLASS].astype("category")
-    return out
-
-
-# =========================
-# DB: Company file + processed DF
-# =========================
-def db_upsert_company_file(con_, filename: str, file_bytes: bytes):
-    con_ = db_ready(con_)
-    now = datetime.now(timezone.utc).isoformat()
-    con_.execute(
-        """
-        INSERT INTO company_sales_file(id, filename, file_bytes, uploaded_at)
-        VALUES(1,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET
-            filename=excluded.filename,
-            file_bytes=excluded.file_bytes,
-            uploaded_at=excluded.uploaded_at
-        """,
-        (str(filename or ""), sqlite3.Binary(file_bytes), now),
-    )
-    con_.commit()
-    return now
-
-
-def db_load_company_file(con_) -> Optional[dict]:
-    con_ = db_ready(con_)
-    row = con_.execute("SELECT filename, file_bytes, uploaded_at FROM company_sales_file WHERE id=1").fetchone()
-    if not row:
-        return None
-    return {"filename": row[0] or "", "file_bytes": bytes(row[1]), "uploaded_at": row[2]}
-
-
-def db_upsert_company_processed(con_, source_uploaded_at: str, df_norm: pd.DataFrame):
-    con_ = db_ready(con_)
-    now = datetime.now(timezone.utc).isoformat()
-    gz_bytes = df_to_gz_bytes(df_norm)
-    con_.execute(
-        """
-        INSERT INTO company_sales_processed(id, source_uploaded_at, df_gz_bytes, created_at, nrows)
-        VALUES(1,?,?,?,?)
-        ON CONFLICT(id) DO UPDATE SET
-            source_uploaded_at=excluded.source_uploaded_at,
-            df_gz_bytes=excluded.df_gz_bytes,
-            created_at=excluded.created_at,
-            nrows=excluded.nrows
-        """,
-        (str(source_uploaded_at), sqlite3.Binary(gz_bytes), now, int(len(df_norm))),
-    )
-    con_.commit()
-
-
-def db_load_company_processed(con_) -> Optional[dict]:
-    con_ = db_ready(con_)
-    row = con_.execute(
-        "SELECT source_uploaded_at, df_gz_bytes, created_at, nrows FROM company_sales_processed WHERE id=1"
-    ).fetchone()
-    if not row:
-        return None
-    return {"source_uploaded_at": row[0], "df_gz_bytes": bytes(row[1]), "created_at": row[2], "nrows": int(row[3])}
-
-
-# =========================
-# DB: Optional personal user file (raw + processed)
-# =========================
-def db_upsert_user_file(con_, username: str, filename: str, file_bytes: bytes):
-    con_ = db_ready(con_)
-    now = datetime.now(timezone.utc).isoformat()
-    con_.execute(
-        """
-        INSERT INTO user_sales_file(username, filename, file_bytes, uploaded_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(username) DO UPDATE SET
-            filename=excluded.filename,
-            file_bytes=excluded.file_bytes,
-            uploaded_at=excluded.uploaded_at
-        """,
-        (str(username), str(filename or ""), sqlite3.Binary(file_bytes), now),
-    )
-    con_.commit()
-    return now
-
-
-def db_load_user_file(con_, username: str) -> Optional[dict]:
-    con_ = db_ready(con_)
-    row = con_.execute(
-        "SELECT filename, file_bytes, uploaded_at FROM user_sales_file WHERE username=?",
-        (str(username),),
-    ).fetchone()
-    if not row:
-        return None
-    return {"filename": row[0] or "", "file_bytes": bytes(row[1]), "uploaded_at": row[2]}
-
-
-def db_upsert_user_processed(con_, username: str, source_uploaded_at: str, df_norm: pd.DataFrame):
-    con_ = db_ready(con_)
-    now = datetime.now(timezone.utc).isoformat()
-    gz_bytes = df_to_gz_bytes(df_norm)
-    con_.execute(
-        """
-        INSERT INTO user_sales_processed(username, source_uploaded_at, df_gz_bytes, created_at, nrows)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(username) DO UPDATE SET
-            source_uploaded_at=excluded.source_uploaded_at,
-            df_gz_bytes=excluded.df_gz_bytes,
-            created_at=excluded.created_at,
-            nrows=excluded.nrows
-        """,
-        (str(username), str(source_uploaded_at), sqlite3.Binary(gz_bytes), now, int(len(df_norm))),
-    )
-    con_.commit()
-
-
-def db_load_user_processed(con_, username: str) -> Optional[dict]:
-    con_ = db_ready(con_)
-    row = con_.execute(
-        "SELECT source_uploaded_at, df_gz_bytes, created_at, nrows FROM user_sales_processed WHERE username=?",
-        (str(username),),
-    ).fetchone()
-    if not row:
-        return None
-    return {"source_uploaded_at": row[0], "df_gz_bytes": bytes(row[1]), "created_at": row[2], "nrows": int(row[3])}
-
-
-# =========================
-# DB: Users list + delete
-# =========================
-def db_list_non_admin_users(con_) -> pd.DataFrame:
-    con_ = db_ready(con_)
-    rows = con_.execute(
-        """
-        SELECT username, agent_id, COALESCE(agent_name,''), is_active
-        FROM users
-        WHERE UPPER(username) <> ?
-        ORDER BY agent_id, username
-        """,
-        (ADMIN_USERNAME,),
-    ).fetchall()
-    df = pd.DataFrame(rows, columns=["username", "agent_id", "agent_name", "is_active"])
-    if df.empty:
-        return df
-    df["is_active"] = df["is_active"].astype(int)
-    return df
-
-
-def db_disable_user(con_, username: str):
-    con_ = db_ready(con_)
-    con_.execute("UPDATE users SET is_active=0 WHERE username=?", (str(username),))
-    con_.commit()
-
-
-def db_delete_user_targets(con_, username: str):
-    con_ = db_ready(con_)
-    con_.execute("DELETE FROM user_class_delta_qty WHERE username=?", (str(username),))
-    con_.commit()
-
-
-def db_delete_user_file(con_, username: str):
-    con_ = db_ready(con_)
-    con_.execute("DELETE FROM user_sales_file WHERE username=?", (str(username),))
-    con_.execute("DELETE FROM user_sales_processed WHERE username=?", (str(username),))
-    con_.commit()
-
-
-def db_hard_delete_user(con_, username: str):
-    con_ = db_ready(con_)
-    con_.execute("DELETE FROM users WHERE username=?", (str(username),))
-    con_.commit()
-
-
-# =========================
-# DB: Per-user targets
-# =========================
-def db_load_user_qty(con_, username: str) -> dict:
-    con_ = db_ready(con_)
-    rows = con_.execute(
-        "SELECT account, cls, delta_qty FROM user_class_delta_qty WHERE username=?",
-        (str(username),),
-    ).fetchall()
-    return {(str(username), str(acc), str(cls)): float(dq or 0.0) for acc, cls, dq in rows}
-
-
-def db_upsert_user_qty(con_, username: str, account: str, cls: str, delta_qty: float):
-    con_ = db_ready(con_)
-    now = datetime.now(timezone.utc).isoformat()
-    con_.execute(
-        """
-        INSERT INTO user_class_delta_qty(username, account, cls, delta_qty, updated_at)
-        VALUES(?,?,?,?,?)
-        ON CONFLICT(username, account, cls) DO UPDATE SET
-            delta_qty=excluded.delta_qty,
-            updated_at=excluded.updated_at
-        """,
-        (str(username), str(account), str(cls), float(delta_qty or 0.0), now),
-    )
-    con_.commit()
-
-
-# =========================
-# Helpers
-# =========================
-def safe_div(a, b):
-    if b in (0, 0.0) or pd.isna(b):
-        return math.nan
-    return a / b
-
-
-def safe_filename(s: str) -> str:
-    s = str(s).strip()
-    s = re.sub(r'[\\/:*?"<>|]+', "_", s)
-    s = re.sub(r"\s+", " ", s)
-    return s[:60] if len(s) > 60 else s
-
-
-def fmt_money(x) -> str:
-    try:
-        return f"₪ {float(x):,.2f}"
-    except Exception:
-        return "₪ 0.00"
-
-
-def fmt_qty(x) -> str:
-    try:
-        return f"{float(x):,.2f}"
-    except Exception:
-        return "0.00"
-
-
-def fmt_pct(x) -> str:
-    if x is None or pd.isna(x):
-        return "—"
-    return f"{float(x):,.1f}%"
-
-
-def user_can_see_col(col_name: str, is_admin: bool, user_visible_cols: list[str]) -> bool:
-    if is_admin:
-        return True
-    return str(col_name) in set([str(x) for x in (user_visible_cols or [])])
-
-
-def user_can_see_money(is_admin: bool, user_visible_cols: list[str]) -> bool:
-    return user_can_see_col(COL_NET, is_admin, user_visible_cols)
-
-
-def user_can_see_qty(is_admin: bool, user_visible_cols: list[str]) -> bool:
-    return user_can_see_col(COL_QTY, is_admin, user_visible_cols)
-
-
-def user_can_see_item(is_admin: bool, user_visible_cols: list[str]) -> bool:
-    return user_can_see_col(COL_ITEM, is_admin, user_visible_cols)
-
-
-# =========================
-# Core computations
-# =========================
-def compute_classes(df: pd.DataFrame) -> pd.DataFrame:
-    g = (
-        df.groupby(COL_CLASS, dropna=False)
-        .agg(sales_money=(COL_NET, "sum"), sales_qty=(COL_QTY, "sum"))
-        .reset_index()
-        .sort_values("sales_money", ascending=False)
-        .reset_index(drop=True)
-    )
-    g["avg_price"] = g.apply(lambda r: safe_div(r["sales_money"], r["sales_qty"]), axis=1)
-    return g
-
-
-def kpi_block_money(
-    s2026: float,
-    s2025: float,
-    diff_money: float,
-    pct: float,
-    share_pct: Optional[float],
-    title_2026: str,
-):
-    share_line = ""
-    if share_pct is not None and not pd.isna(share_pct):
-        share_line = f"<div class='sub'>נתח לקוח מהמכירות של הסוכן: {fmt_pct(share_pct)}</div>"
-
-    st.markdown(
-        f"""
-        <div class="kpi-grid">
-            <div class="kpi">
-                <div class="label">{title_2026}</div>
-                <div class="value">{fmt_money(s2026)}</div>
-                {share_line}
-            </div>
-            <div class="kpi">
-                <div class="label">מכירות 2025 (₪)</div>
-                <div class="value">{fmt_money(s2025)}</div>
-                <div class="sub">סכום נטו מהקובץ</div>
-            </div>
-            <div class="kpi">
-                <div class="label">הפרש (₪)</div>
-                <div class="value">{fmt_money(diff_money)}</div>
-                <div class="sub">2026 - 2025</div>
-            </div>
-            <div class="kpi">
-                <div class="label">שינוי (%)</div>
-                <div class="value">{fmt_pct(pct)}</div>
-                <div class="sub">(2026/2025)*100 - 100</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def kpi_block_qty(q2026: float, q2025: float, diff_qty: float, pct: float, title_2026: str):
-    st.markdown(
-        f"""
-        <div class="kpi-grid">
-            <div class="kpi">
-                <div class="label">{title_2026}</div>
-                <div class="value">{fmt_qty(q2026)}</div>
-                <div class="sub">כמות</div>
-            </div>
-            <div class="kpi">
-                <div class="label">כמות 2025</div>
-                <div class="value">{fmt_qty(q2025)}</div>
-                <div class="sub">סה״כ כמות מהקובץ</div>
-            </div>
-            <div class="kpi">
-                <div class="label">הפרש (כמות)</div>
-                <div class="value">{fmt_qty(diff_qty)}</div>
-                <div class="sub">2026 - 2025</div>
-            </div>
-            <div class="kpi">
-                <div class="label">שינוי (%)</div>
-                <div class="value">{fmt_pct(pct)}</div>
-                <div class="sub">(2026/2025)*100 - 100</div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =========================
-# Targets logic (per-user)
-# =========================
-def get_delta_qty(user_qty: dict, username: str, account: str, cls: str) -> float:
-    return float(user_qty.get((str(username), str(account), str(cls)), 0.0) or 0.0)
-
-
-def build_class_view(user_qty: dict, username: str, account: str, df_customer: pd.DataFrame) -> pd.DataFrame:
-    class_df = compute_classes(df_customer)
-    class_df["delta_qty"] = class_df[COL_CLASS].astype(str).apply(lambda c: get_delta_qty(user_qty, username, account, c))
-
-    def qty_to_money_row(r):
-        p = r["avg_price"]
-        dq = float(r["delta_qty"] or 0.0)
-        if pd.isna(p) or float(p) == 0:
-            return 0.0
-        return dq * float(p)
-
-    class_df["delta_money"] = class_df.apply(qty_to_money_row, axis=1)
-    class_df["target_money"] = class_df["sales_money"] + class_df["delta_money"]
-    class_df["target_qty"] = class_df["sales_qty"] + class_df["delta_qty"]
-
-    out = class_df[
-        [COL_CLASS, "sales_money", "sales_qty", "avg_price", "delta_money", "delta_qty", "target_money", "target_qty"]
-    ].copy()
-
-    out = out.rename(
-        columns={
-            COL_CLASS: "שם קוד מיון פריט",
-            "sales_money": "מכירות_בכסף",
-            "sales_qty": "מכירות_בכמות",
-            "avg_price": "מחיר_ממוצע",
-            "delta_money": "תוספת_יעד_כסף",
-            "delta_qty": "תוספת_יעד_כמות",
-            "target_money": "יעד_בכסף",
-            "target_qty": "יעד_בכמות",
-        }
-    )
-    return out
-
-
-def _allowed_accounts(df_scope: pd.DataFrame, selected_accounts: Optional[list[str]]) -> set:
-    scope_accounts = set(df_scope[COL_ACCOUNT].dropna().astype(str).tolist())
-    if selected_accounts is None:
-        return scope_accounts
-    return set([str(x) for x in selected_accounts]) & scope_accounts
-
-
-def compute_scope_kpi_money(username: str, df_scope: pd.DataFrame, user_qty: dict, selected_accounts: Optional[list[str]]):
-    class_sales = compute_classes(df_scope)
-    allowed = _allowed_accounts(df_scope, selected_accounts)
-
-    def agg_qty_delta(cls: str) -> float:
-        total = 0.0
-        for (u, acc, c), dq in user_qty.items():
-            if str(u) != str(username):
-                continue
-            if str(acc) not in allowed:
-                continue
-            if str(c) == str(cls):
-                total += float(dq or 0.0)
-        return total
-
-    class_sales["delta_qty"] = class_sales[COL_CLASS].astype(str).apply(agg_qty_delta)
-
-    def qty_to_money_row(r):
-        p = r["avg_price"]
-        dq = float(r["delta_qty"] or 0.0)
-        if pd.isna(p) or float(p) == 0:
-            return 0.0
-        return dq * float(p)
-
-    class_sales["delta_money"] = class_sales.apply(qty_to_money_row, axis=1)
-
-    s2025 = float(pd.to_numeric(class_sales["sales_money"], errors="coerce").fillna(0.0).sum())
-    add_money = float(pd.to_numeric(class_sales["delta_money"], errors="coerce").fillna(0.0).sum())
-    s2026 = s2025 + add_money
-    diff = s2026 - s2025
-    pct = (safe_div(s2026, s2025) * 100 - 100) if s2025 > 0 else math.nan
-    return s2025, s2026, diff, pct
-
-
-def compute_scope_kpi_qty(username: str, df_scope: pd.DataFrame, user_qty: dict, selected_accounts: Optional[list[str]]):
-    class_sales = compute_classes(df_scope)
-    allowed = _allowed_accounts(df_scope, selected_accounts)
-
-    def agg_qty_delta(cls: str) -> float:
-        total = 0.0
-        for (u, acc, c), dq in user_qty.items():
-            if str(u) != str(username):
-                continue
-            if str(acc) not in allowed:
-                continue
-            if str(c) == str(cls):
-                total += float(dq or 0.0)
-        return total
-
-    class_sales["delta_qty"] = class_sales[COL_CLASS].astype(str).apply(agg_qty_delta)
-
-    q2025 = float(pd.to_numeric(class_sales["sales_qty"], errors="coerce").fillna(0.0).sum())
-    add_qty = float(pd.to_numeric(class_sales["delta_qty"], errors="coerce").fillna(0.0).sum())
-    q2026 = q2025 + add_qty
-    diff = q2026 - q2025
-    pct = (safe_div(q2026, q2025) * 100 - 100) if q2025 > 0 else math.nan
-    return q2025, q2026, diff, pct
-
-
-def build_scope_class_summary_table(
-    username: str,
-    df_scope: pd.DataFrame,
-    user_qty: dict,
-    selected_accounts: Optional[list[str]],
-    include_targets: bool,
-) -> pd.DataFrame:
-    base = compute_classes(df_scope).copy()
-    base = base.rename(
-        columns={
-            COL_CLASS: "שם קוד מיון פריט",
-            "sales_money": "מכירות_בכסף",
-            "sales_qty": "מכירות_בכמות",
-            "avg_price": "מחיר_ממוצע",
-        }
-    )
-
-    if not include_targets:
-        return base[["שם קוד מיון פריט", "מכירות_בכסף", "מכירות_בכמות", "מחיר_ממוצע"]].copy()
-
-    allowed = _allowed_accounts(df_scope, selected_accounts)
-
-    def agg_qty_delta(cls: str) -> float:
-        total = 0.0
-        for (u, acc, c), dq in user_qty.items():
-            if str(u) != str(username):
-                continue
-            if str(acc) not in allowed:
-                continue
-            if str(c) == str(cls):
-                total += float(dq or 0.0)
-        return total
-
-    base["תוספת_יעד_כמות"] = base["שם קוד מיון פריט"].astype(str).apply(agg_qty_delta)
-
-    def qty_to_money_row(r):
-        p = r["מחיר_ממוצע"]
-        dq = float(r["תוספת_יעד_כמות"] or 0.0)
-        if pd.isna(p) or float(p) == 0:
-            return 0.0
-        return dq * float(p)
-
-    base["תוספת_יעד_כסף"] = base.apply(qty_to_money_row, axis=1)
-    base["יעד_בכסף"] = base["מכירות_בכסף"] + base["תוספת_יעד_כסף"]
-    base["יעד_בכמות"] = base["מכירות_בכמות"] + base["תוספת_יעד_כמות"]
-
-    return base[
-        [
-            "שם קוד מיון פריט",
-            "מכירות_בכסף",
-            "מכירות_בכמות",
-            "מחיר_ממוצע",
-            "תוספת_יעד_כסף",
-            "תוספת_יעד_כמות",
-            "יעד_בכסף",
-            "יעד_בכמות",
-        ]
-    ].copy()
-
-
-# =========================
-# Excel report
-# =========================
-def build_agent_sales_report_2025_2026(username: str, agent_df: pd.DataFrame, user_qty: dict) -> pd.DataFrame:
-    customers = agent_df[COL_ACCOUNT].dropna().astype(str).unique().tolist()
-    rows = []
-    for acc in customers:
-        df_c = agent_df[agent_df[COL_ACCOUNT].astype(str) == str(acc)].copy()
-        if df_c.empty:
-            continue
-        class_view = build_class_view(user_qty, username, str(acc), df_c)
-        s2025 = float(pd.to_numeric(class_view["מכירות_בכסף"], errors="coerce").fillna(0.0).sum())
-        add_money = float(pd.to_numeric(class_view["תוספת_יעד_כסף"], errors="coerce").fillna(0.0).sum())
-        s2026 = s2025 + add_money
-        diff = s2026 - s2025
-        pct = (safe_div(s2026, s2025) * 100 - 100) if s2025 > 0 else math.nan
-
-        rows.append(
-            {
-                "שם לקוח": str(acc),
-                "מכירות 2025": s2025,
-                "מכירות 2026": s2026,
-                "הפרש בין 2025 ל 2026": diff,
-                "שינוי באחוזים": pct,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    df = df.sort_values("מכירות 2025", ascending=False).reset_index(drop=True)
-
-    t2025 = float(pd.to_numeric(df["מכירות 2025"], errors="coerce").fillna(0.0).sum())
-    t2026 = float(pd.to_numeric(df["מכירות 2026"], errors="coerce").fillna(0.0).sum())
-    tdiff = t2026 - t2025
-    tpct = (safe_div(t2026, t2025) * 100 - 100) if t2025 > 0 else math.nan
-
-    df_total = pd.DataFrame(
-        [
-            {
-                "שם לקוח": "סה״כ",
-                "מכירות 2025": t2025,
-                "מכירות 2026": t2026,
-                "הפרש בין 2025 ל 2026": tdiff,
-                "שינוי באחוזים": tpct,
-            }
-        ]
-    )
-    return pd.concat([df, df_total], ignore_index=True)
-
-
-def make_agent_sales_excel(title: str, df_report: pd.DataFrame) -> bytes:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "דוח"
-    ws.sheet_view.rightToLeft = True
-
-    font_title = Font(bold=True, size=13)
-    font_bold = Font(bold=True)
-    thin = Side(style="thin", color="D0D0D0")
-    border_all = Border(left=thin, right=thin, top=thin, bottom=thin)
-    fill_header = PatternFill("solid", fgColor="F3F4F6")
-    fill_total = PatternFill("solid", fgColor="E5E7EB")
-
-    ws.merge_cells("A1:E1")
-    ws["A1"].value = title
-    ws["A1"].font = font_title
-    ws["A1"].alignment = Alignment(horizontal="right", vertical="center")
-    ws.row_dimensions[1].height = 22
-
-    start_row = 3
-    cols = ["שם לקוח", "מכירות 2025", "מכירות 2026", "הפרש בין 2025 ל 2026", "שינוי באחוזים"]
-
-    df = df_report.copy()
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    df = df[cols]
-
-    for j, col_name in enumerate(cols, start=1):
-        cell = ws.cell(row=start_row, column=j, value=col_name)
-        cell.font = font_bold
-        cell.fill = fill_header
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border_all
-
-    for i, row in enumerate(df.itertuples(index=False), start=start_row + 1):
-        is_total = (str(row[0]).strip() == "סה״כ")
-        for j, value in enumerate(row, start=1):
-            c = ws.cell(row=i, column=j, value=value)
-            c.border = border_all
-            c.alignment = Alignment(horizontal="right" if j == 1 else "center", vertical="center")
-            if j in (2, 3, 4):
-                c.number_format = "#,##0.00"
-            elif j == 5:
-                c.number_format = "0.0"
-            if is_total:
-                c.font = font_bold
-                c.fill = fill_total
-
-    widths = {1: 34, 2: 18, 3: 18, 4: 22, 5: 16}
-    for j, w in widths.items():
-        ws.column_dimensions[get_column_letter(j)].width = w
-    ws.freeze_panes = ws["A4"]
-
-    bio = BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
-
-
-# =========================
-# FAST LOAD: processed DF (self-heal)
-# =========================
-@st.cache_data(show_spinner=False)
-def load_company_sales_df_cached(source_uploaded_at: str, gz_bytes: bytes) -> pd.DataFrame:
-    return df_from_gz_bytes(gz_bytes)
-
-
-def get_company_sales_df(con_) -> pd.DataFrame:
-    con_ = db_ready(con_)
-    company = db_load_company_file(con_)
-    if company is None:
-        raise ValueError("אין קובץ חברה במערכת.")
-
-    proc = db_load_company_processed(con_)
-    if proc is not None and str(proc["source_uploaded_at"]) == str(company["uploaded_at"]):
-        return load_company_sales_df_cached(proc["source_uploaded_at"], proc["df_gz_bytes"])
-
-    df_raw = read_sales_excel_bytes(company["file_bytes"])
-    df_norm = normalize_sales_strict(df_raw)
-    db_upsert_company_processed(con_, company["uploaded_at"], df_norm)
-    proc2 = db_load_company_processed(con_)
-    return load_company_sales_df_cached(proc2["source_uploaded_at"], proc2["df_gz_bytes"])
-
-
-@st.cache_data(show_spinner=False)
-def load_user_sales_df_cached(username: str, source_uploaded_at: str, gz_bytes: bytes) -> pd.DataFrame:
-    return df_from_gz_bytes(gz_bytes)
-
-
-def get_user_sales_df(con_, username: str) -> Optional[pd.DataFrame]:
-    con_ = db_ready(con_)
-    raw = db_load_user_file(con_, username)
-    if raw is None:
-        return None
-
-    proc = db_load_user_processed(con_, username)
-    if proc is not None and str(proc["source_uploaded_at"]) == str(raw["uploaded_at"]):
-        return load_user_sales_df_cached(username, proc["source_uploaded_at"], proc["df_gz_bytes"])
-
-    df_raw = read_sales_excel_bytes(raw["file_bytes"])
-    df_norm = normalize_sales_strict(df_raw)
-    db_upsert_user_processed(con_, username, raw["uploaded_at"], df_norm)
-    proc2 = db_load_user_processed(con_, username)
-    return load_user_sales_df_cached(username, proc2["source_uploaded_at"], proc2["df_gz_bytes"])
-
-
-# =========================
-# Header
-# =========================
-st.markdown(
+def render_target_editing_view(df: pd.DataFrame, account_name: str, username: str):
     """
-<div class="card">
-  <h2>📊 Uzeb — ניהול יעדי מכירות</h2>
-  <p>קובץ מרכזי אחד לכל החברה. סוכן רואה רק את שלו. ADMIN יכול לראות הכל ולסנן לפי סוכן/משתמש.</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
+    ממשק עריכה עבור לקוח ספציפי:
+    מציג רשימת פריטים, קוד מיון לידם, ואפשרות להזין יעד (Delta).
+    """
+    st.subheader(f"🎯 עריכת יעדים עבור: {account_name}")
+    
+    # סינון הנתונים ללקוח הנבחר
+    acc_df = df[df[COL_ACCOUNT] == account_name].copy()
+    
+    if acc_df.empty:
+        st.warning("לא נמצאו פריטים עבור לקוח זה.")
+        return
+
+    # חיפוש פריט בתוך ממשק העריכה
+    search = st.text_input("🔍 חיפוש פריט מהיר:", placeholder="הקלד שם פריט...")
+    if search:
+        acc_df_to_show = acc_df[acc_df[COL_ITEM].str.contains(search, na=False, case=False)]
+    else:
+        acc_df_to_show = acc_df
+
+    st.markdown("---")
+    
+    # יצירת כותרות לטבלה
+    head_col1, head_col2, head_col3, head_col4 = st.columns([3, 2, 1, 1])
+    with head_col1: st.write("**שם פריט**")
+    with head_col2: st.write("**קוד מיון**")
+    with head_col3: st.write("**כמות 2025**")
+    with head_col4: st.write("**עדכון יעד (Delta)**")
+
+    # ריצה על הפריטים ויצירת שורות עריכה
+    for idx, row in acc_df_to_show.iterrows():
+        item_name = row[COL_ITEM]
+        item_class = row[COL_CLASS]
+        current_qty = row[COL_QTY]
+        
+        c1, c2, c3, c4 = st.columns([3, 2, 1, 1])
+        
+        with c1:
+            st.text(item_name)
+        with c2:
+            st.caption(item_class)
+        with c3:
+            st.text(f"{int(current_qty)} יח'")
+        with c4:
+            new_val = st.number_input(
+                "עדכון", 
+                value=0.0, 
+                key=f"delta_{account_name}_{item_name}", 
+                label_visibility="collapsed"
+            )
+            if new_val != 0:
+                if st.button("שמור", key=f"btn_{idx}"):
+                    update_item_delta(username, account_name, item_name, item_class, new_val)
+                    st.toast(f"היעד עבור {item_name} עודכן!")
+
+    # --- הוספת טבלת פירוט בתחתית (לפי הבקשה) ---
+    st.markdown("---")
+    st.subheader("📊 פירוט פריטים ונתח מכירות")
+    
+    # חישוב נתח מכירות (Share) בכסף
+    total_sales = acc_df[COL_NET].sum()
+    if total_sales > 0:
+        acc_df['נתח מכירות %'] = ((acc_df[COL_NET] / total_sales) * 100).round(1)
+        
+        # הצגת הטבלה המפורטת
+        st.dataframe(
+            acc_df[[COL_ITEM, COL_CLASS, COL_QTY, COL_NET, 'נתח מכירות %']].sort_values(by=COL_NET, ascending=False),
+            use_container_width=True,
+            hide_index=True
+        )
+        st.info(f"סה\"כ מכירות ללקוח: {total_sales:,.2f} ₪")
+    else:
+        st.info("אין נתוני מכירות כספיים להצגה עבור לקוח זה.")
 
 # =========================
-# Sidebar: DB Path + DB filename (NEW)
+# MAIN APP
 # =========================
-with st.sidebar:
-    st.markdown("### שמירה (SQLite)")
-    st.text_input("נתיב תיקייה למסד נתונים", key="db_dir")
 
-    # NEW: DB filename control (reset by changing this)
-    st.text_input("שם קובץ מסד נתונים (לשינוי/איפוס בענן)", key="db_filename")
-    st.caption("טיפ: אם הענן התחיל לעשות בעיות, שנה שם קובץ כאן כדי ליצור DB חדש ונקי.")
+def main():
+    if "auth" not in st.session_state:
+        st.session_state.auth = False
+        st.session_state.is_admin = False
 
-    new_db_path = get_db_path()
-    st.caption(f"DB: {new_db_path.as_posix()}")
+    if not st.session_state.auth:
+        st.title("Uzeb Targets 2025")
+        with st.container():
+            u = st.text_input("משתמש")
+            p = st.text_input("סיסמה", type="password")
+            if st.button("כניסה"):
+                if u == ADMIN_USERNAME and p == ADMIN_PASSWORD:
+                    st.session_state.auth = True
+                    st.session_state.is_admin = True
+                    st.session_state.username = u
+                    st.rerun()
+                elif u != "":
+                    st.session_state.auth = True
+                    st.session_state.username = u
+                    st.rerun()
+        return
 
-    if "db_path_last" not in st.session_state:
-        st.session_state["db_path_last"] = str(db_path)
+    st.sidebar.title(f"שלום, {st.session_state.username}")
+    mode = st.sidebar.radio("ניווט:", ["צפייה בנתונים", "עריכת יעדי לקוח", "ניהול קבצים"])
 
-    if str(new_db_path) != st.session_state["db_path_last"]:
-        # switch DB
-        db_path = new_db_path
-        con = get_db(str(db_path))
-        st.session_state["db_path_last"] = str(db_path)
-        st.cache_data.clear()
+    # --- הנתונים המקוריים שלך ---
+    df_main = pd.DataFrame({
+        COL_ACCOUNT: ["קרמיקה אבי", "קרמיקה אבי", "הכל לבית", "הכל לבית"],
+        COL_ITEM: ["ברז מטבח נשלף", "מזלף ניקל", "כיור גרניט", "סיפון"],
+        COL_CLASS: ["ברזים", "מקלחות", "כיורים", "אינסטלציה"],
+        COL_QTY: [50, 120, 30, 200],
+        COL_NET: [15000, 4000, 25000, 2000]
+    })
+
+    if mode == "צפייה בנתונים":
+        st.header("📊 מצב מכירות 2025")
+        cols = [COL_ACCOUNT, COL_ITEM, COL_CLASS, COL_QTY]
+        if st.session_state.is_admin:
+            cols.insert(3, COL_NET)
+        st.dataframe(df_main[cols], use_container_width=True, hide_index=True)
+
+    elif mode == "עריכת יעדי לקוח":
+        st.header("✏️ ממשק עריכת יעדים")
+        all_accounts = df_main[COL_ACCOUNT].unique()
+        selected_acc = st.selectbox("בחר לקוח לעריכה:", all_accounts)
+        
+        if selected_acc:
+            render_target_editing_view(df_main, selected_acc, st.session_state.username)
+
+    if st.sidebar.button("התנתק"):
+        st.session_state.auth = False
         st.rerun()
 
-# =========================
-# Sidebar: Login
-# =========================
-with st.sidebar:
-    st.markdown("---")
-    st.markdown("### כניסה")
-
-    if st.session_state.get("logged_in") != True:
-        users_df = db_list_non_admin_users(con)
-        if not users_df.empty:
-            users_df = users_df[users_df["is_active"] == 1].copy()
-
-        usernames = []
-        if users_df is not None and not users_df.empty:
-            usernames = sorted(users_df["username"].astype(str).unique().tolist(), key=lambda x: x.lower())
-
-        login_options = [ADMIN_USERNAME] + usernames
-        u_in = st.selectbox("שם משתמש", options=login_options, index=0, key="login_user")
-        p_in = st.text_input("סיסמה", type="password", key="login_pass")
-
-        if st.button("כניסה", use_container_width=True):
-            ok, u = verify_login(con, u_in, p_in)
-            if not ok:
-                st.error("שם משתמש/סיסמה לא תקינים או משתמש לא פעיל.")
-                st.stop()
-            st.session_state["logged_in"] = True
-            st.session_state["login_username"] = str(u["username"])
-            st.session_state["is_admin"] = bool(u.get("is_admin", False))
-            st.session_state["agent_id"] = str(u.get("agent_id", "") or "").strip()
-            st.session_state["agent_name"] = str(u.get("agent_name", "") or "").strip()
-            st.rerun()
-    else:
-        is_admin = bool(st.session_state.get("is_admin", False))
-        st.success(f"מחובר: {st.session_state.get('login_username')}" + (" (ADMIN)" if is_admin else ""))
-        if not is_admin:
-            st.caption(f"סוכן: {agent_label(st.session_state.get('agent_id'))}")
-        if st.button("יציאה", use_container_width=True):
-            st.session_state.clear()
-            st.cache_data.clear()
-            st.rerun()
-
-# =========================
-# Require login
-# =========================
-if st.session_state.get("logged_in") != True:
-    st.info("⬅️ יש להתחבר מהצד כדי להתחיל.")
-    st.stop()
-
-IS_ADMIN = bool(st.session_state.get("is_admin", False))
-
-# Load permissions
-USER_VISIBLE_COLS = db_load_user_visible_cols(con)
-CAN_SEE_MONEY = user_can_see_money(IS_ADMIN, USER_VISIBLE_COLS)
-CAN_SEE_QTY = user_can_see_qty(IS_ADMIN, USER_VISIBLE_COLS)
-CAN_SEE_ITEM = user_can_see_item(IS_ADMIN, USER_VISIBLE_COLS)
-
-# =========================
-# Admin view mode (company-wide)
-# =========================
-admin_company_wide = False
-if IS_ADMIN:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### ADMIN — מצב תצוגה")
-    admin_company_wide = st.checkbox("תצוגת חברה מלאה (כל הסוכנים)", value=False)
-    st.caption("בתצוגת חברה מלאה: אין חיבור ליעדי משתמשים (targets) — זו תצוגת מכירות בלבד.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# =========================
-# Sidebar: ADMIN actions
-# =========================
-with st.sidebar:
-    if IS_ADMIN:
-        st.markdown("---")
-        st.markdown("### ADMIN — קובץ חברה (מרכזי)")
-
-        company_saved = db_load_company_file(con)
-        if company_saved is not None:
-            st.caption(
-                f"קובץ חברה שמור: {company_saved['filename'] or 'company.xlsx'} | עודכן: {company_saved['uploaded_at']}"
-            )
-            proc = db_load_company_processed(con)
-            if proc is not None and proc["source_uploaded_at"] == company_saved["uploaded_at"]:
-                st.caption(f"✅ נתונים מעובדים שמורים (n={proc['nrows']}) | נוצר: {proc['created_at']}")
-            else:
-                st.caption("⚠️ אין נתונים מעובדים תואמים (ייווצר אוטומטית).")
-        else:
-            st.caption("אין קובץ חברה שמור עדיין.")
-
-        up_company = st.file_uploader("העלה/החלף קובץ חברה (.xlsx)", type=["xlsx"], key="company_uploader")
-        if up_company is not None:
-            try:
-                uploaded_at = db_upsert_company_file(con, up_company.name, up_company.getvalue())
-                df_raw = read_sales_excel_bytes(up_company.getvalue())
-                df_norm = normalize_sales_strict(df_raw)
-                db_upsert_company_processed(con, uploaded_at, df_norm)
-                st.success("קובץ חברה נשמר + עיבוד נתונים בוצע.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"שגיאה בעיבוד/שמירה: {e}")
-                st.stop()
-
-        st.markdown("---")
-        st.markdown("### ADMIN — ניהול תצוגה למשתמשים (לפי סוג משתמש)")
-
-        available_cols = [COL_AGENT, COL_ACCOUNT, COL_CLASS, COL_QTY, COL_NET, COL_ITEM]
-        try:
-            proc = db_load_company_processed(con)
-            if proc is not None:
-                df_tmp = load_company_sales_df_cached(proc["source_uploaded_at"], proc["df_gz_bytes"])
-                available_cols = sorted([str(c) for c in df_tmp.columns])
-        except Exception:
-            pass
-
-        min_display = [COL_ACCOUNT, COL_CLASS]
-        current = [c for c in (USER_VISIBLE_COLS or []) if c in available_cols]
-
-        picked = st.multiselect(
-            "בחר עמודות מתוך קובץ הנתונים שמותר למשתמשים רגילים לראות",
-            options=available_cols,
-            default=current,
-            key="admin_visible_cols_pick",
-        )
-
-        for c in min_display:
-            if c in available_cols and c not in picked:
-                picked.append(c)
-
-        if st.button("שמור הגדרות תצוגה", use_container_width=True, key="admin_save_visible_cols"):
-            db_save_user_visible_cols(con, picked)
-            st.success("נשמר.")
-            st.rerun()
-
-        st.markdown("---")
-        st.markdown("### ADMIN — יצירת משתמשים")
-        new_u = st.text_input("משתמש חדש", key="admin_new_u")
-        new_p = st.text_input("סיסמה חדשה", type="password", key="admin_new_p")
-        new_agent = st.text_input("מספר סוכן (agent_id)", key="admin_new_agent")
-        new_agent_name = st.text_input("שם סוכן (אופציונלי)", key="admin_new_agent_name")
-        if st.button("צור משתמש", use_container_width=True, key="admin_create_user"):
-            try:
-                create_user(con, new_u, new_p, new_agent, new_agent_name)
-                st.success("נוצר משתמש.")
-                st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("שם משתמש כבר קיים.")
-            except Exception as e:
-                st.error(f"שגיאה: {e}")
-
-        st.markdown("---")
-        st.markdown("### ADMIN — מחיקת משתמש")
-
-        users_df_all = db_list_non_admin_users(con)
-        if users_df_all.empty:
-            st.caption("אין משתמשים למחיקה.")
-        else:
-            users_df_all["label"] = users_df_all.apply(
-                lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (" | לא פעיל" if int(r["is_active"]) != 1 else ""),
-                axis=1,
-            )
-            labels = users_df_all["label"].tolist()
-            label_to_user = dict(zip(users_df_all["label"].tolist(), users_df_all["username"].tolist()))
-
-            chosen_label = st.selectbox("בחר משתמש למחיקה", options=labels, key="admin_delete_pick")
-            del_user = str(label_to_user[chosen_label])
-
-            mode = st.radio(
-                "סוג מחיקה",
-                options=[
-                    "השבת משתמש (מומלץ) — לא יוכל להתחבר",
-                    "מחיקה מלאה (מסוכן) — מחיקת משתמש + נתונים",
-                ],
-                index=0,
-                key="admin_delete_mode",
-            )
-
-            wipe_targets = st.checkbox("למחוק גם יעדים (targets) של המשתמש", value=True, key="admin_wipe_targets")
-            wipe_file = st.checkbox("למחוק גם קובץ אישי של המשתמש (אם קיים)", value=True, key="admin_wipe_file")
-            confirm_text = st.text_input("להקליד DELETE כדי לאשר", key="admin_delete_confirm")
-
-            if st.button("בצע מחיקה", use_container_width=True, key="admin_delete_btn"):
-                if confirm_text.strip().upper() != "DELETE":
-                    st.error("לא אושר. יש להקליד DELETE.")
-                    st.stop()
-
-                try:
-                    if mode.startswith("השבת"):
-                        db_disable_user(con, del_user)
-                        if wipe_targets:
-                            db_delete_user_targets(con, del_user)
-                        if wipe_file:
-                            db_delete_user_file(con, del_user)
-                        st.success("המשתמש הושבת. (וגם נמחקו נתונים לפי הבחירה)")
-                    else:
-                        if wipe_targets:
-                            db_delete_user_targets(con, del_user)
-                        if wipe_file:
-                            db_delete_user_file(con, del_user)
-                        db_hard_delete_user(con, del_user)
-                        st.success("המשתמש נמחק לחלוטין.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"שגיאה במחיקה: {e}")
-
-# =========================
-# Resolve context user
-# =========================
-if not IS_ADMIN:
-    context_username = str(st.session_state["login_username"])
-    context_agent_id = str(st.session_state["agent_id"]).strip()
-else:
-    if admin_company_wide:
-        context_username = ADMIN_USERNAME
-        context_agent_id = "__ALL__"
-    else:
-        users_df = db_list_non_admin_users(con)
-        users_df = users_df[users_df["is_active"] == 1].copy()
-        if users_df.empty:
-            st.error("אין משתמשים פעילים במערכת (מלבד ADMIN).")
-            st.stop()
-
-        agent_ids = sorted(users_df["agent_id"].astype(str).unique().tolist(), key=lambda x: str(x))
-        if "admin_agent_filter" not in st.session_state:
-            st.session_state["admin_agent_filter"] = agent_ids[0]
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### ADMIN — סינון")
-        chosen_agent_id = st.selectbox(
-            "בחר סוכן",
-            options=agent_ids,
-            index=agent_ids.index(st.session_state["admin_agent_filter"]) if st.session_state["admin_agent_filter"] in agent_ids else 0,
-            format_func=agent_label,
-        )
-        st.session_state["admin_agent_filter"] = chosen_agent_id
-
-        cand = users_df[users_df["agent_id"].astype(str) == str(chosen_agent_id)].copy()
-        cand["label"] = cand.apply(
-            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (f" | {r['agent_name']}" if r["agent_name"] else ""),
-            axis=1,
-        )
-        labels = cand["label"].tolist()
-        label_to_user = {cand.iloc[i]["label"]: cand.iloc[i]["username"] for i in range(len(cand))}
-
-        if "admin_user_pick" not in st.session_state or st.session_state["admin_user_pick"] not in cand["username"].tolist():
-            st.session_state["admin_user_pick"] = cand.iloc[0]["username"]
-
-        current_label = cand[cand["username"] == st.session_state["admin_user_pick"]]["label"].iloc[0]
-        chosen_label = st.selectbox("בחר משתמש", options=labels, index=labels.index(current_label))
-        context_username = str(label_to_user[chosen_label])
-        context_agent_id = str(chosen_agent_id).strip()
-        st.caption(f"מציג נתונים עבור: {context_username} | {agent_label(context_agent_id)}")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# =========================
-# Load per-user targets
-# =========================
-user_qty = {}
-qty_key = f"user_qty::{context_username}"
-if not (IS_ADMIN and admin_company_wide):
-    if qty_key not in st.session_state:
-        st.session_state[qty_key] = db_load_user_qty(con, context_username)
-    user_qty = st.session_state[qty_key]
-
-# =========================
-# DATA SOURCE
-# =========================
-company_saved = db_load_company_file(con)
-if company_saved is None:
-    st.error("אין קובץ חברה במערכת. ADMIN חייב להעלות קובץ חברה מרכזי.")
-    st.stop()
-
-data_source = "company"
-personal_df = None
-if not (IS_ADMIN and admin_company_wide):
-    personal_df = get_user_sales_df(con, context_username)
-
-if (not IS_ADMIN) and (personal_df is not None):
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### מקור נתונים")
-    data_source = st.radio(
-        "בחר מקור נתונים",
-        options=["קובץ חברה (מומלץ)", "קובץ אישי שלי (אופציונלי)"],
-        index=0,
-        horizontal=True,
-        key=f"data_source::{context_username}",
-    )
-    data_source = "company" if "חברה" in data_source else "personal"
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with st.spinner("טוען נתונים..."):
-    company_df = get_company_sales_df(con)
-
-sales_all = company_df if data_source == "company" else personal_df
-if sales_all is None:
-    st.error("אין נתונים לטעינה.")
-    st.stop()
-
-# =========================
-# Scope data
-# =========================
-if IS_ADMIN and admin_company_wide:
-    scope_df = sales_all.copy()
-    scope_title = "חברה מלאה (כל הסוכנים)"
-    scope_agent_display = "כל החברה"
-else:
-    if not context_agent_id:
-        st.error("למשתמש אין agent_id. ADMIN צריך לעדכן/ליצור משתמש עם agent_id.")
-        st.stop()
-    scope_df = sales_all[sales_all[COL_AGENT].astype(str) == str(context_agent_id)].copy()
-    if scope_df.empty:
-        st.error(f"לא נמצאו רשומות לסוכן {agent_label(context_agent_id)} בקובץ הנתונים.")
-        st.stop()
-    scope_title = f"סוכן: {agent_label(context_agent_id)}"
-    scope_agent_display = agent_label(context_agent_id)
-
-# =========================
-# KPI + Tables
-# =========================
-st.markdown('<div class="card">', unsafe_allow_html=True)
-st.markdown(f"### נתונים — {scope_title}")
-if not IS_ADMIN:
-    st.caption("המערכת מציגה רק את המכירות של הסוכן המחובר (סינון לפי עמודת 'סוכן בחשבון').")
-st.markdown("</div>", unsafe_allow_html=True)
-
-# --- Customer table + share(%) out of agent/company scope total ---
-scope_total_money_2025 = float(pd.to_numeric(scope_df[COL_NET], errors="coerce").fillna(0.0).sum())
-
-cust_table = (
-    scope_df.groupby(COL_ACCOUNT)
-    .agg(sum_money=(COL_NET, "sum"), sum_qty=(COL_QTY, "sum"))
-    .reset_index()
-    .sort_values("sum_money", ascending=False)
-    .reset_index(drop=True)
-)
-
-cust_table["share_pct"] = cust_table["sum_money"].apply(
-    lambda x: safe_div(float(x), scope_total_money_2025) * 100 if scope_total_money_2025 > 0 else math.nan
-)
-
-customer_options = cust_table[COL_ACCOUNT].astype(str).tolist()
-
-
-def customer_format(acc: str) -> str:
-    row = cust_table[cust_table[COL_ACCOUNT].astype(str) == str(acc)]
-    if row.empty:
-        return str(acc)
-    p = float(row["share_pct"].iloc[0]) if "share_pct" in row.columns else math.nan
-    return f"{acc} — {fmt_pct(p)}"
-
-
-sel_key = f"cust_selection::{context_username}::{context_agent_id}::{admin_company_wide}"
-if sel_key not in st.session_state:
-    st.session_state[sel_key] = []
-
-left, right = st.columns([1, 2], gap="large")
-
-with left:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### בחירת לקוחות (אופציונלי)")
-    st.caption("ברירת מחדל: לא נבחר לקוח → KPI מוצג עבור כל הטווח. לעריכת יעדים בחר לקוח יחיד.")
-    st.session_state[sel_key] = st.multiselect(
-        "לקוחות (מסודר לפי מכירות) — עם נתח ליד השם",
-        options=customer_options,
-        default=st.session_state.get(sel_key, []),
-        format_func=customer_format,
-        key=f"ms_customers::{context_username}::{context_agent_id}::{admin_company_wide}",
-    )
-
-    st.markdown("#### טבלת לקוחות — 2025")
-
-    cust_table_disp = cust_table.rename(
-        columns={
-            COL_ACCOUNT: "שם לקוח",
-            "sum_money": "סהכ_כסף",
-            "sum_qty": "סהכ_כמות",
-            "share_pct": "נתח (%)",
-        }
-    )
-
-    # Agents/users: identical to ADMIN, but WITHOUT the money column.
-    if IS_ADMIN:
-        cols = ["שם לקוח", "סהכ_כסף", "סהכ_כמות", "נתח (%)"]
-        cfg = {
-            "שם לקוח": st.column_config.TextColumn("שם לקוח"),
-            "סהכ_כסף": st.column_config.NumberColumn("מכירות 2025 (₪)", format="%.2f"),
-            "סהכ_כמות": st.column_config.NumberColumn("כמות", format="%.2f"),
-            "נתח (%)": st.column_config.NumberColumn("נתח (%)", format="%.1f"),
-        }
-    else:
-        cols = ["שם לקוח", "סהכ_כמות", "נתח (%)"]
-        cfg = {
-            "שם לקוח": st.column_config.TextColumn("שם לקוח"),
-            "סהכ_כמות": st.column_config.NumberColumn("כמות", format="%.2f"),
-            "נתח (%)": st.column_config.NumberColumn("נתח (%)", format="%.1f"),
-        }
-
-    st.dataframe(cust_table_disp[cols], use_container_width=True, hide_index=True, column_config=cfg)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with right:
-    selected_customers = [str(x) for x in st.session_state.get(sel_key, [])]
-    none_selected = len(selected_customers) == 0
-    single = len(selected_customers) == 1
-
-    if none_selected:
-        df_scope = scope_df.copy()
-        scope_subtitle = "כל הלקוחות"
-        share_pct = None
-        selected_accounts_for_scope = None
-    elif single:
-        df_scope = scope_df[scope_df[COL_ACCOUNT].astype(str) == str(selected_customers[0])].copy()
-        scope_subtitle = f"לקוח: {selected_customers[0]}"
-        cust_sales_money_2025 = float(pd.to_numeric(df_scope[COL_NET], errors="coerce").fillna(0.0).sum())
-        share_pct = safe_div(cust_sales_money_2025, scope_total_money_2025) * 100 if scope_total_money_2025 > 0 else math.nan
-        selected_accounts_for_scope = [str(selected_customers[0])]
-    else:
-        df_scope = scope_df[scope_df[COL_ACCOUNT].astype(str).isin(selected_customers)].copy()
-        scope_subtitle = f"{len(selected_customers)} לקוחות (מסונן)"
-        share_pct = None
-        selected_accounts_for_scope = [str(x) for x in selected_customers]
-
-    if df_scope.empty:
-        st.error("לא נמצאו נתונים בתצוגה הנבחרת.")
-        st.stop()
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown("### תצוגה")
-    st.caption(scope_subtitle)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # KPI
-    if IS_ADMIN and admin_company_wide:
-        if CAN_SEE_MONEY:
-            s2025 = float(pd.to_numeric(df_scope[COL_NET], errors="coerce").fillna(0.0).sum())
-            kpi_block_money(
-                s2025,
-                s2025,
-                0.0,
-                0.0 if s2025 > 0 else math.nan,
-                share_pct if single else None,
-                "מכירות 2026 (₪) — ללא יעדים",
-            )
-        else:
-            q2025 = float(pd.to_numeric(df_scope[COL_QTY], errors="coerce").fillna(0.0).sum())
-            kpi_block_qty(q2025, q2025, 0.0, 0.0 if q2025 > 0 else math.nan, "כמות 2026 — ללא יעדים")
-    else:
-        if CAN_SEE_MONEY:
-            s2025, s2026, diff, pct = compute_scope_kpi_money(context_username, df_scope, user_qty, selected_accounts_for_scope)
-            kpi_block_money(s2026, s2025, diff, pct, share_pct if single else None, "מכירות/יעד 2026 (₪)")
-        else:
-            q2025, q2026, diff, pct = compute_scope_kpi_qty(context_username, df_scope, user_qty, selected_accounts_for_scope)
-            kpi_block_qty(q2026, q2025, diff, pct, "כמות/יעד 2026")
-
-    # Read-only class breakdown when NOT single customer
-    if not single:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### פירוט לפי קודי מיון (קריאה בלבד)")
-        st.caption("מוצג לפי הטווח שנבחר. אין עריכת יעדים במצב זה.")
-
-        if IS_ADMIN and admin_company_wide:
-            cls_tbl = build_scope_class_summary_table(context_username, df_scope, user_qty, selected_accounts_for_scope, include_targets=False)
-        else:
-            cls_tbl = build_scope_class_summary_table(context_username, df_scope, user_qty, selected_accounts_for_scope, include_targets=True)
-
-        if CAN_SEE_MONEY:
-            show_cols = ["שם קוד מיון פריט", "מכירות_בכסף", "מחיר_ממוצע"]
-            cfg2 = {
-                "שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון"),
-                "מכירות_בכסף": st.column_config.NumberColumn("מכירות (₪)", format="%.2f"),
-                "מחיר_ממוצע": st.column_config.NumberColumn("מחיר ממוצע", format="%.2f"),
-            }
-            if CAN_SEE_QTY:
-                show_cols.insert(2, "מכירות_בכמות")
-                cfg2["מכירות_בכמות"] = st.column_config.NumberColumn("כמות", format="%.2f")
-
-            for c, label, fmt in [
-                ("תוספת_יעד_כסף", "תוספת יעד (₪)", "%.2f"),
-                ("תוספת_יעד_כמות", "תוספת יעד (כמות)", "%.2f"),
-                ("יעד_בכסף", "2026 (₪)", "%.2f"),
-                ("יעד_בכמות", "2026 (כמות)", "%.2f"),
-            ]:
-                if c in cls_tbl.columns:
-                    if (c.endswith("כמות") or c.endswith("בכמות")) and (not CAN_SEE_QTY):
-                        continue
-                    show_cols.append(c)
-                    cfg2[c] = st.column_config.NumberColumn(label, format=fmt)
-        else:
-            show_cols = ["שם קוד מיון פריט"]
-            cfg2 = {"שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון")}
-            if CAN_SEE_QTY:
-                for c, label in [("מכירות_בכמות", "כמות 2025"), ("תוספת_יעד_כמות", "תוספת יעד (כמות)"), ("יעד_בכמות", "כמות 2026")]:
-                    if c in cls_tbl.columns:
-                        show_cols.append(c)
-                        cfg2[c] = st.column_config.NumberColumn(label, format="%.2f")
-
-        st.dataframe(cls_tbl[show_cols], use_container_width=True, hide_index=True, column_config=cfg2)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # Excel download (money-based)
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(f"### דוח אקסל — {scope_agent_display}")
-
-    if (not IS_ADMIN) and (not CAN_SEE_MONEY):
-        st.info("הורדת דוח Excel חסומה למשתמשים רגילים כאשר נתוני כסף אינם מורשים לתצוגה.")
-    else:
-        st.caption("שם לקוח | מכירות 2025 | מכירות 2026 | הפרש | שינוי %")
-        if IS_ADMIN and admin_company_wide:
-            rep = (
-                df_scope.groupby(COL_ACCOUNT)
-                .agg(sales_2025=(COL_NET, "sum"))
-                .reset_index()
-                .rename(columns={COL_ACCOUNT: "שם לקוח", "sales_2025": "מכירות 2025"})
-                .sort_values("מכירות 2025", ascending=False)
-                .reset_index(drop=True)
-            )
-            rep["מכירות 2026"] = rep["מכירות 2025"]
-            rep["הפרש בין 2025 ל 2026"] = 0.0
-            rep["שינוי באחוזים"] = 0.0
-
-            t2025 = float(pd.to_numeric(rep["מכירות 2025"], errors="coerce").fillna(0.0).sum())
-            rep = pd.concat(
-                [
-                    rep,
-                    pd.DataFrame(
-                        [{
-                            "שם לקוח": "סה״כ",
-                            "מכירות 2025": t2025,
-                            "מכירות 2026": t2025,
-                            "הפרש בין 2025 ל 2026": 0.0,
-                            "שינוי באחוזים": 0.0 if t2025 > 0 else math.nan,
-                        }]
-                    ),
-                ],
-                ignore_index=True,
-            )
-
-            st.download_button(
-                "⬇️ הורד דוח חברה (Excel)",
-                data=make_agent_sales_excel("דוח חברה (2025→2026) — מכירות בלבד", rep),
-                file_name="uzeb_company_sales_2025_2026.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-        else:
-            agent_sales_df = build_agent_sales_report_2025_2026(context_username, scope_df, user_qty)
-            fname = f"uzeb_{safe_filename(str(context_agent_id))}__{safe_filename(context_username)}__sales_2025_2026.xlsx"
-            st.download_button(
-                "⬇️ הורד דוח מכירות (Excel)",
-                data=make_agent_sales_excel(f"דוח מכירות {scope_agent_display} (2025→2026): {context_username}", agent_sales_df),
-                file_name=fname,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    # Single-customer editing (targets)
-    if (not (IS_ADMIN and admin_company_wide)) and single:
-        account = selected_customers[0]
-        df_cust = df_scope.copy()
-
-        class_view = build_class_view(user_qty, context_username, account, df_cust)
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### עריכת יעדים (לקוח יחיד)")
-        st.info("✏️ ערוך **תוספת יעד (כמות)**. שאר השדות מחושבים אוטומטית.")
-
-        base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
-
-        if CAN_SEE_MONEY:
-            editor_df = base_df[
-                [
-                    "שם קוד מיון פריט",
-                    "מכירות_בכסף",
-                    "מכירות_בכמות",
-                    "מחיר_ממוצע",
-                    "תוספת_יעד_כמות",
-                    "תוספת_יעד_כסף",
-                    "יעד_בכסף",
-                    "יעד_בכמות",
-                ]
-            ].copy()
-
-            column_config = {
-                "שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון", disabled=True),
-                "מכירות_בכסף": st.column_config.NumberColumn("מכירות (₪)", disabled=True, format="%.2f"),
-                "מכירות_בכמות": st.column_config.NumberColumn("כמות", disabled=True, format="%.2f"),
-                "מחיר_ממוצע": st.column_config.NumberColumn("מחיר ממוצע", disabled=True, format="%.2f"),
-                "תוספת_יעד_כמות": st.column_config.NumberColumn("תוספת יעד (כמות)", step=1.0, format="%.2f"),
-                "תוספת_יעד_כסף": st.column_config.NumberColumn("תוספת יעד (₪)", disabled=True, format="%.2f"),
-                "יעד_בכסף": st.column_config.NumberColumn("2026 (₪)", disabled=True, format="%.2f"),
-                "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות)", disabled=True, format="%.2f"),
-            }
-        else:
-            editor_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
-            if CAN_SEE_QTY:
-                editor_cols += ["מכירות_בכמות", "יעד_בכמות"]
-            editor_df = base_df[editor_cols].copy()
-
-            column_config = {
-                "שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון", disabled=True),
-                "תוספת_יעד_כמות": st.column_config.NumberColumn("תוספת יעד (כמות)", step=1.0, format="%.2f"),
-            }
-            if CAN_SEE_QTY:
-                column_config.update(
-                    {
-                        "מכירות_בכמות": st.column_config.NumberColumn("כמות", disabled=True, format="%.2f"),
-                        "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות)", disabled=True, format="%.2f"),
-                    }
-                )
-
-        with st.form(key=f"targets_form::{context_username}::{context_agent_id}::{account}", clear_on_submit=False):
-            edited = st.data_editor(
-                editor_df,
-                hide_index=True,
-                use_container_width=True,
-                column_config=column_config,
-                key=f"class_editor::{context_username}::{context_agent_id}::{account}",
-            )
-            b1, b2 = st.columns([1, 1], gap="small")
-            with b1:
-                refresh_clicked = st.form_submit_button("רענן חישוב", use_container_width=True)
-            with b2:
-                save_clicked = st.form_submit_button("שמור למסד", use_container_width=True)
-
-        if refresh_clicked or save_clicked:
-            edited["תוספת_יעד_כמות"] = pd.to_numeric(edited["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
-
-            for _, r in edited.iterrows():
-                cls = str(r["שם קוד מיון פריט"])
-                dq = float(r["תוספת_יעד_כמות"] or 0.0)
-                key = (str(context_username), str(account), str(cls))
-                user_qty[key] = dq
-                if save_clicked:
-                    db_upsert_user_qty(con, context_username, account, cls, dq)
-
-            st.session_state[qty_key] = user_qty
-
-            if CAN_SEE_MONEY:
-                s2025_, s2026_, diff_, pct_ = compute_scope_kpi_money(context_username, df_scope, user_qty, [account])
-                kpi_block_money(s2026_, s2025_, diff_, pct_, share_pct, "מכירות/יעד 2026 (₪)")
-            else:
-                q2025_, q2026_, diff_, pct_ = compute_scope_kpi_qty(context_username, df_scope, user_qty, [account])
-                kpi_block_qty(q2026_, q2025_, diff_, pct_, "כמות/יעד 2026")
-
-            st.success("נשמר ועודכן." if save_clicked else "עודכן.")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    elif (IS_ADMIN and admin_company_wide) and (len(selected_customers) >= 1):
-        st.info("בתצוגת חברה מלאה אין עריכת יעדים. כבה את 'תצוגת חברה מלאה' כדי לערוך יעדים לסוכן/משתמש.")
+if __name__ == "__main__":
+    main()
