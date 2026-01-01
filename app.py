@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.5.3 (FULL FILE)
+Uzeb Sales Targets — v8.5.4 (FULL FILE)
 
-ONLY CHANGE (per request):
-- "טבלת לקוחות — 2025" for agents/users is identical to ADMIN table,
-  but WITHOUT the "מכירות 2025 (₪)" column.
-  (ADMIN still sees: name + sales + qty + share)
+UPDATES (per request):
+1) Fix “worked yesterday / fails today” on Streamlit Cloud (most common cause: old SQLite schema/data):
+   - DB filename is now configurable from the sidebar.
+   - Default DB filename changed (new clean DB by default on first deploy).
+   - Admin can reset by changing DB filename (no coding needed).
 
-Everything else unchanged from v8.5.2.
+2) Kept your last UI change:
+   - Agents/users: "טבלת לקוחות — 2025" identical to ADMIN but WITHOUT "מכירות 2025 (₪)" column.
+   - ADMIN: sees name + sales + qty + share.
+
+Everything else kept as-is from your v8.5.3 logic.
 """
 
 import base64
@@ -119,16 +124,26 @@ def agent_label(agent_raw) -> str:
 # =========================
 # DB (deploy-safe)
 # =========================
-DB_FILENAME = "uzeb_app.sqlite"
 DEFAULT_DB_DIR = Path(".") / "data"
+
+# IMPORTANT: default DB file changed so Streamlit Cloud starts clean by default.
+DEFAULT_DB_FILENAME = "uzeb_app_v8_5_4.sqlite"
 
 if "db_dir" not in st.session_state:
     st.session_state["db_dir"] = str(DEFAULT_DB_DIR)
 
+if "db_filename" not in st.session_state:
+    st.session_state["db_filename"] = DEFAULT_DB_FILENAME
+
 
 def get_db_path() -> Path:
     d = Path(str(st.session_state.get("db_dir", str(DEFAULT_DB_DIR))).strip())
-    return d / DB_FILENAME
+    fn = str(st.session_state.get("db_filename", DEFAULT_DB_FILENAME)).strip() or DEFAULT_DB_FILENAME
+    # safety: forbid path separators inside filename
+    fn = re.sub(r"[\\/]+", "_", fn)
+    if not fn.lower().endswith(".sqlite"):
+        fn = f"{fn}.sqlite"
+    return d / fn
 
 
 def ensure_db_dir_exists(db_path: Path):
@@ -255,14 +270,13 @@ def get_db(db_path_str: str) -> sqlite3.Connection:
     return db_connect(Path(db_path_str))
 
 
-db_path = get_db_path()
-con = get_db(str(db_path))
-
-
 def db_ready(con_: sqlite3.Connection) -> sqlite3.Connection:
     ensure_all_schema(con_)
     return con_
 
+
+db_path = get_db_path()
+con = get_db(str(db_path))
 
 # =========================
 # Serialization helpers
@@ -776,7 +790,6 @@ def get_delta_qty(user_qty: dict, username: str, account: str, cls: str) -> floa
 
 def build_class_view(user_qty: dict, username: str, account: str, df_customer: pd.DataFrame) -> pd.DataFrame:
     class_df = compute_classes(df_customer)
-
     class_df["delta_qty"] = class_df[COL_CLASS].astype(str).apply(lambda c: get_delta_qty(user_qty, username, account, c))
 
     def qty_to_money_row(r):
@@ -791,16 +804,7 @@ def build_class_view(user_qty: dict, username: str, account: str, df_customer: p
     class_df["target_qty"] = class_df["sales_qty"] + class_df["delta_qty"]
 
     out = class_df[
-        [
-            COL_CLASS,
-            "sales_money",
-            "sales_qty",
-            "avg_price",
-            "delta_money",
-            "delta_qty",
-            "target_money",
-            "target_qty",
-        ]
+        [COL_CLASS, "sales_money", "sales_qty", "avg_price", "delta_money", "delta_qty", "target_money", "target_qty"]
     ].copy()
 
     out = out.rename(
@@ -1116,11 +1120,16 @@ st.markdown(
 )
 
 # =========================
-# Sidebar: DB Path
+# Sidebar: DB Path + DB filename (NEW)
 # =========================
 with st.sidebar:
     st.markdown("### שמירה (SQLite)")
     st.text_input("נתיב תיקייה למסד נתונים", key="db_dir")
+
+    # NEW: DB filename control (reset by changing this)
+    st.text_input("שם קובץ מסד נתונים (לשינוי/איפוס בענן)", key="db_filename")
+    st.caption("טיפ: אם הענן התחיל לעשות בעיות, שנה שם קובץ כאן כדי ליצור DB חדש ונקי.")
+
     new_db_path = get_db_path()
     st.caption(f"DB: {new_db_path.as_posix()}")
 
@@ -1128,9 +1137,11 @@ with st.sidebar:
         st.session_state["db_path_last"] = str(db_path)
 
     if str(new_db_path) != st.session_state["db_path_last"]:
+        # switch DB
         db_path = new_db_path
         con = get_db(str(db_path))
         st.session_state["db_path_last"] = str(db_path)
+        st.cache_data.clear()
         st.rerun()
 
 # =========================
@@ -1171,6 +1182,7 @@ with st.sidebar:
             st.caption(f"סוכן: {agent_label(st.session_state.get('agent_id'))}")
         if st.button("יציאה", use_container_width=True):
             st.session_state.clear()
+            st.cache_data.clear()
             st.rerun()
 
 # =========================
@@ -1288,8 +1300,7 @@ with st.sidebar:
             st.caption("אין משתמשים למחיקה.")
         else:
             users_df_all["label"] = users_df_all.apply(
-                lambda r: f"{r['username']} | {agent_label(r['agent_id'])}"
-                + (" | לא פעיל" if int(r["is_active"]) != 1 else ""),
+                lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (" | לא פעיל" if int(r["is_active"]) != 1 else ""),
                 axis=1,
             )
             labels = users_df_all["label"].tolist()
@@ -1362,17 +1373,14 @@ else:
         chosen_agent_id = st.selectbox(
             "בחר סוכן",
             options=agent_ids,
-            index=agent_ids.index(st.session_state["admin_agent_filter"])
-            if st.session_state["admin_agent_filter"] in agent_ids
-            else 0,
+            index=agent_ids.index(st.session_state["admin_agent_filter"]) if st.session_state["admin_agent_filter"] in agent_ids else 0,
             format_func=agent_label,
         )
         st.session_state["admin_agent_filter"] = chosen_agent_id
 
         cand = users_df[users_df["agent_id"].astype(str) == str(chosen_agent_id)].copy()
         cand["label"] = cand.apply(
-            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}"
-            + (f" | {r['agent_name']}" if r["agent_name"] else ""),
+            lambda r: f"{r['username']} | {agent_label(r['agent_id'])}" + (f" | {r['agent_name']}" if r["agent_name"] else ""),
             axis=1,
         )
         labels = cand["label"].tolist()
@@ -1459,7 +1467,7 @@ if not IS_ADMIN:
     st.caption("המערכת מציגה רק את המכירות של הסוכן המחובר (סינון לפי עמודת 'סוכן בחשבון').")
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --- Customer table + share(%) out of agent total ---
+# --- Customer table + share(%) out of agent/company scope total ---
 scope_total_money_2025 = float(pd.to_numeric(scope_df[COL_NET], errors="coerce").fillna(0.0).sum())
 
 cust_table = (
@@ -1514,8 +1522,7 @@ with left:
         }
     )
 
-    # ===== ONLY CHANGE IN THIS VERSION =====
-    # Agents: identical to ADMIN table, but WITHOUT "מכירות 2025 (₪)" column.
+    # Agents/users: identical to ADMIN, but WITHOUT the money column.
     if IS_ADMIN:
         cols = ["שם לקוח", "סהכ_כסף", "סהכ_כמות", "נתח (%)"]
         cfg = {
@@ -1535,9 +1542,6 @@ with left:
     st.dataframe(cust_table_disp[cols], use_container_width=True, hide_index=True, column_config=cfg)
     st.markdown("</div>", unsafe_allow_html=True)
 
-# =========================
-# The rest of the app UI (unchanged)
-# =========================
 with right:
     selected_customers = [str(x) for x in st.session_state.get(sel_key, [])]
     none_selected = len(selected_customers) == 0
@@ -1599,13 +1603,9 @@ with right:
         st.caption("מוצג לפי הטווח שנבחר. אין עריכת יעדים במצב זה.")
 
         if IS_ADMIN and admin_company_wide:
-            cls_tbl = build_scope_class_summary_table(
-                context_username, df_scope, user_qty, selected_accounts_for_scope, include_targets=False
-            )
+            cls_tbl = build_scope_class_summary_table(context_username, df_scope, user_qty, selected_accounts_for_scope, include_targets=False)
         else:
-            cls_tbl = build_scope_class_summary_table(
-                context_username, df_scope, user_qty, selected_accounts_for_scope, include_targets=True
-            )
+            cls_tbl = build_scope_class_summary_table(context_username, df_scope, user_qty, selected_accounts_for_scope, include_targets=True)
 
         if CAN_SEE_MONEY:
             show_cols = ["שם קוד מיון פריט", "מכירות_בכסף", "מחיר_ממוצע"]
@@ -1633,11 +1633,7 @@ with right:
             show_cols = ["שם קוד מיון פריט"]
             cfg2 = {"שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון")}
             if CAN_SEE_QTY:
-                for c, label in [
-                    ("מכירות_בכמות", "כמות 2025"),
-                    ("תוספת_יעד_כמות", "תוספת יעד (כמות)"),
-                    ("יעד_בכמות", "כמות 2026"),
-                ]:
+                for c, label in [("מכירות_בכמות", "כמות 2025"), ("תוספת_יעד_כמות", "תוספת יעד (כמות)"), ("יעד_בכמות", "כמות 2026")]:
                     if c in cls_tbl.columns:
                         show_cols.append(c)
                         cfg2[c] = st.column_config.NumberColumn(label, format="%.2f")
@@ -1702,7 +1698,7 @@ with right:
             )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Single-customer editing (targets) — unchanged
+    # Single-customer editing (targets)
     if (not (IS_ADMIN and admin_company_wide)) and single:
         account = selected_customers[0]
         df_cust = df_scope.copy()
@@ -1740,7 +1736,6 @@ with right:
                 "יעד_בכמות": st.column_config.NumberColumn("2026 (כמות)", disabled=True, format="%.2f"),
             }
         else:
-            # Minimal view but still editable delta qty
             editor_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
             if CAN_SEE_QTY:
                 editor_cols += ["מכירות_בכמות", "יעד_בכמות"]
