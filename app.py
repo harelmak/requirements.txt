@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.8.1 (FULL FILE)
+Uzeb Sales Targets — v8.9.0 (FULL FILE)
 
-Fixes (per user report: "I don't see computed values"):
-1) Force recompute + redraw after refresh/save:
-   - After class targets refresh/save => st.rerun()
-   - After items refresh/save => st.rerun()
+Persistence guarantee (code-side):
+1) DB path is FIXED and does NOT depend on session_state (no accidental DB switching after logout).
+   - DB dir is resolved in this order:
+     a) st.secrets["UZEB_DB_DIR"] (if exists)
+     b) ENV var UZEB_DB_DIR
+     c) ./data folder next to this app.py
+2) Logout does NOT clear DB configuration (we no longer store DB dir in session_state).
+3) Admin tools:
+   - Backup DB (download current SQLite file)
+   - Restore DB (upload .sqlite to replace; clears caches + rerun)
 
-2) Default column-picks for "עריכת יעדים (לקוח יחיד)" include monthly computed columns
-   (only when CAN_SEE_QTY).
-
-3) Computed columns are always recomputed from fresh views (class_view/base_df rebuilt on rerun).
-
-Notes:
-- Monthly values = yearly qty / 12
-- DB stores only results snapshots (monthly_avg_2025_qty, monthly_add_qty) in both class+item tables
-- Item deltas aggregate into class totals for KPI + class view
+Important:
+- If your hosting environment wipes local disk on restart (ephemeral filesystem), no SQLite code can
+  guarantee persistence. In that case you must mount a persistent volume or use an external DB.
 """
 
 import base64
@@ -89,7 +89,6 @@ footer { visibility: hidden; }
 div.stButton > button { border-radius: 12px !important; font-weight: 900 !important; }
 [data-testid="stDataFrame"], [data-testid="stTable"] { border-radius: 12px; overflow: hidden; }
 
-/* Mobile/Tablet */
 @media (max-width: 900px) {
   .block-container { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
   .card { padding: 12px 12px; border-radius: 16px; }
@@ -98,7 +97,7 @@ div.stButton > button { border-radius: 12px !important; font-weight: 900 !import
 }
 @media (max-width: 768px) {
   div[data-testid="stHorizontalBlock"] { flex-direction: column !important; }
-  div[data-testid="column"] { width: 100% !important; flex: 1 1 100% !important; }
+  div[data-testid="stDataFrame"] { width: 100% !important; }
   .kpi { min-width: 100%; }
   div.stButton > button { width: 100% !important; }
 }
@@ -130,18 +129,41 @@ def agent_label(agent_raw) -> str:
 
 
 # =========================
-# DB (deploy-safe)
+# DB Path (PERSISTENT)
 # =========================
 DB_FILENAME = "uzeb_app.sqlite"
-DEFAULT_DB_DIR = Path(".") / "data"
 
-if "db_dir" not in st.session_state:
-    st.session_state["db_dir"] = str(DEFAULT_DB_DIR)
+
+def _app_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path(".").resolve()
+
+
+def resolve_db_dir() -> Path:
+    # Priority: secrets > env > ./data next to app
+    d = None
+    try:
+        if hasattr(st, "secrets") and "UZEB_DB_DIR" in st.secrets:
+            d = str(st.secrets.get("UZEB_DB_DIR", "")).strip()
+    except Exception:
+        d = None
+
+    if not d:
+        d = str(os.environ.get("UZEB_DB_DIR", "")).strip()
+
+    if not d:
+        d = str((_app_dir() / "data").as_posix())
+
+    p = Path(d)
+    if not p.is_absolute():
+        p = (_app_dir() / p).resolve()
+    return p
 
 
 def get_db_path() -> Path:
-    d = Path(str(st.session_state.get("db_dir", str(DEFAULT_DB_DIR))).strip())
-    return d / DB_FILENAME
+    return resolve_db_dir() / DB_FILENAME
 
 
 def ensure_db_dir_exists(db_path: Path):
@@ -296,13 +318,13 @@ def get_db(db_path_str: str) -> sqlite3.Connection:
     return db_connect(Path(db_path_str))
 
 
-db_path = get_db_path()
-con = get_db(str(db_path))
-
-
 def db_ready(con_: sqlite3.Connection) -> sqlite3.Connection:
     ensure_all_schema(con_)
     return con_
+
+
+db_path = get_db_path()
+con = get_db(str(db_path))
 
 
 # =========================
@@ -595,20 +617,20 @@ def db_load_user_processed(con_, username: str) -> Optional[dict]:
 
 
 # =========================
-# DB: Users list + delete
+# DB: Users admin helpers
 # =========================
 def db_list_non_admin_users(con_) -> pd.DataFrame:
     con_ = db_ready(con_)
     rows = con_.execute(
         """
-        SELECT username, agent_id, COALESCE(agent_name,''), is_active
+        SELECT username, agent_id, COALESCE(agent_name,''), is_active, created_at
         FROM users
         WHERE UPPER(username) <> ?
         ORDER BY agent_id, username
         """,
         (ADMIN_USERNAME,),
     ).fetchall()
-    df = pd.DataFrame(rows, columns=["username", "agent_id", "agent_name", "is_active"])
+    df = pd.DataFrame(rows, columns=["username", "agent_id", "agent_name", "is_active", "created_at"])
     if df.empty:
         return df
     df["is_active"] = df["is_active"].astype(int)
@@ -618,6 +640,12 @@ def db_list_non_admin_users(con_) -> pd.DataFrame:
 def db_disable_user(con_, username: str):
     con_ = db_ready(con_)
     con_.execute("UPDATE users SET is_active=0 WHERE username=?", (str(username),))
+    con_.commit()
+
+
+def db_enable_user(con_, username: str):
+    con_ = db_ready(con_)
+    con_.execute("UPDATE users SET is_active=1 WHERE username=?", (str(username),))
     con_.commit()
 
 
@@ -920,7 +948,6 @@ def build_class_view(
     class_df["target_money"] = class_df["sales_money"] + class_df["delta_money"]
     class_df["target_qty"] = class_df["sales_qty"] + class_df["delta_qty"]
 
-    # monthly columns
     class_df["monthly_avg_2025_qty"] = class_df["sales_qty"].apply(lambda x: float(x or 0.0) / MONTHS_IN_YEAR)
     class_df["monthly_add_qty"] = class_df["delta_qty"].apply(lambda x: float(x or 0.0) / MONTHS_IN_YEAR)
     class_df["monthly_target_2026_qty"] = class_df["target_qty"].apply(lambda x: float(x or 0.0) / MONTHS_IN_YEAR)
@@ -1211,6 +1238,41 @@ def get_user_sales_df(con_, username: str) -> Optional[pd.DataFrame]:
 
 
 # =========================
+# DB Backup / Restore (ADMIN)
+# =========================
+def read_db_file_bytes(db_path_: Path) -> bytes:
+    if not db_path_.exists():
+        return b""
+    return db_path_.read_bytes()
+
+
+def atomic_write(path: Path, data: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def restore_db_from_upload(upload_bytes: bytes):
+    # Close existing connection best-effort
+    try:
+        con.close()
+    except Exception:
+        pass
+    atomic_write(db_path, upload_bytes)
+
+    # Clear caches so next run reconnects to the new DB
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
+
+# =========================
 # Header
 # =========================
 st.markdown(
@@ -1224,22 +1286,22 @@ st.markdown(
 )
 
 # =========================
-# Sidebar: DB Path
+# Sidebar: DB info (read-only)
 # =========================
 with st.sidebar:
     st.markdown("### שמירה (SQLite)")
-    st.text_input("נתיב תיקייה למסד נתונים", key="db_dir")
-    new_db_path = get_db_path()
-    st.caption(f"DB: {new_db_path.as_posix()}")
+    st.caption(f"DB DIR: {db_path.parent.as_posix()}")
+    st.caption(f"DB: {db_path.as_posix()}")
+    st.caption(f"DB exists: {db_path.exists()}")
+    try:
+        n_users_now = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        st.caption(f"Users in DB: {int(n_users_now)}")
+    except Exception:
+        pass
 
-    if "db_path_last" not in st.session_state:
-        st.session_state["db_path_last"] = str(db_path)
-
-    if str(new_db_path) != st.session_state["db_path_last"]:
-        db_path = new_db_path
-        con = get_db(str(db_path))
-        st.session_state["db_path_last"] = str(db_path)
-        st.rerun()
+    # Warning if looks ephemeral (heuristic)
+    if str(db_path.parent).lower().startswith(("/tmp", "c:\\windows\\temp")):
+        st.warning("⚠️ נתיב ה-DB נראה זמני. לשמירה קבועה צריך תיקייה קבועה/Volume מתמשך.")
 
 # =========================
 # Sidebar: Login
@@ -1278,6 +1340,7 @@ with st.sidebar:
         if not is_admin:
             st.caption(f"סוכן: {agent_label(st.session_state.get('agent_id'))}")
         if st.button("יציאה", use_container_width=True):
+            # No db_dir in session_state; safe to clear all.
             st.session_state.clear()
             st.rerun()
 
@@ -1313,6 +1376,25 @@ if IS_ADMIN:
 with st.sidebar:
     if IS_ADMIN:
         st.markdown("---")
+        st.markdown("### ADMIN — גיבוי/שחזור DB")
+
+        db_bytes = read_db_file_bytes(db_path)
+        st.download_button(
+            "⬇️ גיבוי DB (SQLite)",
+            data=db_bytes if db_bytes else b"",
+            file_name="uzeb_app.sqlite",
+            mime="application/x-sqlite3",
+            use_container_width=True,
+            disabled=(not bool(db_bytes)),
+        )
+
+        up_db = st.file_uploader("שחזור DB (העלה uzeb_app.sqlite)", type=["sqlite", "db", "sqlite3"], key="db_restore")
+        if up_db is not None:
+            restore_db_from_upload(up_db.getvalue())
+            st.success("שחזור DB בוצע. מרענן…")
+            st.rerun()
+
+        st.markdown("---")
         st.markdown("### ADMIN — קובץ חברה (מרכזי)")
 
         company_saved = db_load_company_file(con)
@@ -1342,7 +1424,7 @@ with st.sidebar:
                 st.stop()
 
         st.markdown("---")
-        st.markdown("### ADMIN — ניהול תצוגה למשתמשים (לפי סוג משתמש)")
+        st.markdown("### ADMIN — ניהול תצוגה למשתמשים")
 
         available_cols = [COL_AGENT, COL_ACCOUNT, COL_CLASS, COL_QTY, COL_NET, COL_ITEM]
         try:
@@ -1387,6 +1469,52 @@ with st.sidebar:
                 st.error("שם משתמש כבר קיים.")
             except Exception as e:
                 st.error(f"שגיאה: {e}")
+
+        st.markdown("---")
+        st.markdown("### ADMIN — ניהול משתמשים")
+        users_manage = db_list_non_admin_users(con)
+        if users_manage.empty:
+            st.caption("אין משתמשים.")
+        else:
+            st.dataframe(users_manage, hide_index=True, use_container_width=True)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                target_user = st.selectbox(
+                    "בחר משתמש לפעולה",
+                    options=users_manage["username"].astype(str).tolist(),
+                    key="admin_action_user",
+                )
+            with col_b:
+                action = st.selectbox(
+                    "פעולה",
+                    options=[
+                        "השבת משתמש",
+                        "הפעל משתמש",
+                        "אפס יעדים למשתמש",
+                        "מחק קובץ אישי למשתמש",
+                        "מחיקה מלאה (משתמש+יעדים+קבצים)",
+                    ],
+                    key="admin_action_kind",
+                )
+            if st.button("בצע פעולה", use_container_width=True, key="admin_do_action"):
+                try:
+                    if action == "השבת משתמש":
+                        db_disable_user(con, target_user)
+                    elif action == "הפעל משתמש":
+                        db_enable_user(con, target_user)
+                    elif action == "אפס יעדים למשתמש":
+                        db_delete_user_targets(con, target_user)
+                    elif action == "מחק קובץ אישי למשתמש":
+                        db_delete_user_file(con, target_user)
+                    else:
+                        db_delete_user_targets(con, target_user)
+                        db_delete_user_file(con, target_user)
+                        db_hard_delete_user(con, target_user)
+                    st.success("בוצע.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"שגיאה: {e}")
 
 # =========================
 # Resolve context user
@@ -1722,7 +1850,6 @@ with right:
 
         base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
 
-        # ---- Column filter (per user) ----
         all_possible_cols = [
             "שם קוד מיון פריט",
             "מכירות_בכסף",
@@ -1753,7 +1880,6 @@ with right:
 
         cols_pref_key = f"class_editor_cols::{context_username}::{context_agent_id}::{account}"
         if cols_pref_key not in st.session_state:
-            # Default includes computed monthly columns if possible
             if CAN_SEE_MONEY and CAN_SEE_QTY:
                 default_cols = [
                     "שם קוד מיון פריט",
@@ -1864,9 +1990,7 @@ with right:
                     db_upsert_user_class_qty(con, context_username, account, cls, dq, monthly_avg_2025_qty, monthly_add_qty)
 
             st.session_state[class_key] = user_class_qty
-
             st.success("נשמר ועודכן." if save_clicked else "עודכן.")
-            # FIX: force rebuild to show computed columns
             st.rerun()
 
         # ========= EDITABLE ITEMS =========
@@ -1929,7 +2053,7 @@ with right:
                         g["מחיר_ממוצע"] = math.nan
 
                     def item_delta_row(r) -> float:
-                        cls_v = str(r[COL_CLASS]) if COL_CLASS in r else ""
+                        cls_v = str(r[COL_CLASS]) if COL_CLASS in r.index else ""
                         item_v = str(r[COL_ITEM])
                         return float(user_item_qty.get((str(context_username), str(account), cls_v, item_v), 0.0) or 0.0)
 
@@ -1951,9 +2075,10 @@ with right:
                         g["תוספת_יעד_כסף"] = dm
                         g["יעד_בכסף"] = pd.to_numeric(g["מכירות_בכסף"], errors="coerce").fillna(0.0) + dm
 
-                    # monthly
                     if "מכירות_בכמות" in g.columns:
-                        g["ממוצע_חודשי_כמות_2025"] = pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
+                        g["ממוצע_חודשי_כמות_2025"] = (
+                            pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
+                        )
                     else:
                         g["ממוצע_חודשי_כמות_2025"] = 0.0
                     g["תוספת_חודשית_כמות"] = pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
@@ -2049,7 +2174,6 @@ with right:
 
                         st.session_state[item_key] = user_item_qty
                         st.success("נשמרו פריטים ועודכן." if items_save else "עודכן (ללא שמירה).")
-                        # FIX: force rebuild to show computed columns
                         st.rerun()
 
         st.markdown("</div>", unsafe_allow_html=True)
