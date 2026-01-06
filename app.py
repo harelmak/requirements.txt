@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.9.0 (FULL FILE)
+Uzeb Sales Targets — v8.9.1 (FULL FILE)
 
-Persistence guarantee (code-side):
-1) DB path is FIXED and does NOT depend on session_state (no accidental DB switching after logout).
-   - DB dir is resolved in this order:
-     a) st.secrets["UZEB_DB_DIR"] (if exists)
-     b) ENV var UZEB_DB_DIR
-     c) ./data folder next to this app.py
-2) Logout does NOT clear DB configuration (we no longer store DB dir in session_state).
-3) Admin tools:
-   - Backup DB (download current SQLite file)
-   - Restore DB (upload .sqlite to replace; clears caches + rerun)
+Change requested:
+- Regular user sees ONLY the Items table (פריטים) and NOT the Class table (קודי מיון) in the single-customer editing area.
+- ADMIN keeps seeing both (Class + Items).
 
-Important:
-- If your hosting environment wipes local disk on restart (ephemeral filesystem), no SQLite code can
-  guarantee persistence. In that case you must mount a persistent volume or use an external DB.
+Notes:
+- KPI remains correct (items deltas are already aggregated into class totals + KPI).
+- No DB schema change.
 """
 
 import base64
@@ -325,7 +318,6 @@ def db_ready(con_: sqlite3.Connection) -> sqlite3.Connection:
 
 db_path = get_db_path()
 con = get_db(str(db_path))
-
 
 # =========================
 # Serialization helpers
@@ -1340,7 +1332,6 @@ with st.sidebar:
         if not is_admin:
             st.caption(f"סוכן: {agent_label(st.session_state.get('agent_id'))}")
         if st.button("יציאה", use_container_width=True):
-            # No db_dir in session_state; safe to clear all.
             st.session_state.clear()
             st.rerun()
 
@@ -1836,67 +1827,41 @@ with right:
     st.markdown("</div>", unsafe_allow_html=True)
 
     # =========================
-    # Single-customer editing (targets) + EDITABLE ITEMS
+    # Single-customer editing (targets) — ADMIN sees Class+Items, regular user sees Items only
     # =========================
     if (not (IS_ADMIN and admin_company_wide)) and single:
         account = selected_customers[0]
         df_cust = df_scope.copy()
 
-        class_view = build_class_view(user_class_qty, user_item_qty, context_username, account, df_cust)
+        # ---------- ADMIN: Class (קוד מיון) editor ----------
+        if IS_ADMIN:
+            class_view = build_class_view(user_class_qty, user_item_qty, context_username, account, df_cust)
 
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### עריכת יעדים (לקוח יחיד)")
-        st.info("✏️ ערוך **תוספת יעד (כמות)**. שאר השדות מחושבים אוטומטית. (תוספות פריטים מצטרפות לקוד המיון)")
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("### עריכת יעדים (לקוח יחיד) — לפי קוד מיון (ADMIN)")
+            st.info("✏️ ערוך **תוספת יעד (כמות)**. שאר השדות מחושבים אוטומטית. (תוספות פריטים מצטרפות לקוד המיון)")
 
-        base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
+            base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
 
-        all_possible_cols = [
-            "שם קוד מיון פריט",
-            "מכירות_בכסף",
-            "מכירות_בכמות",
-            "מחיר_ממוצע",
-            "ממוצע_חודשי_כמות_2025",
-            "תוספת_יעד_כמות",
-            "תוספת_חודשית_כמות",
-            "תוספת_יעד_כסף",
-            "יעד_בכסף",
-            "יעד_בכמות",
-            "יעד_חודשי_כמות_2026",
-        ]
-
-        allowed_cols = ["שם קוד מיון פריט"]
-        if CAN_SEE_MONEY:
-            allowed_cols += ["מכירות_בכסף", "מחיר_ממוצע", "תוספת_יעד_כסף", "יעד_בכסף"]
-        if CAN_SEE_QTY:
-            allowed_cols += [
+            all_possible_cols = [
+                "שם קוד מיון פריט",
+                "מכירות_בכסף",
                 "מכירות_בכמות",
+                "מחיר_ממוצע",
                 "ממוצע_חודשי_כמות_2025",
                 "תוספת_יעד_כמות",
                 "תוספת_חודשית_כמות",
+                "תוספת_יעד_כסף",
+                "יעד_בכסף",
                 "יעד_בכמות",
                 "יעד_חודשי_כמות_2026",
             ]
-        allowed_cols = [c for c in all_possible_cols if c in set(allowed_cols)]
 
-        cols_pref_key = f"class_editor_cols::{context_username}::{context_agent_id}::{account}"
-        if cols_pref_key not in st.session_state:
-            if CAN_SEE_MONEY and CAN_SEE_QTY:
-                default_cols = [
-                    "שם קוד מיון פריט",
-                    "מכירות_בכסף",
-                    "מכירות_בכמות",
-                    "ממוצע_חודשי_כמות_2025",
-                    "מחיר_ממוצע",
-                    "תוספת_יעד_כמות",
-                    "תוספת_חודשית_כמות",
-                    "תוספת_יעד_כסף",
-                    "יעד_בכסף",
-                    "יעד_בכמות",
-                    "יעד_חודשי_כמות_2026",
-                ]
-            elif CAN_SEE_QTY:
-                default_cols = [
-                    "שם קוד מיון פריט",
+            allowed_cols = ["שם קוד מיון פריט"]
+            if CAN_SEE_MONEY:
+                allowed_cols += ["מכירות_בכסף", "מחיר_ממוצע", "תוספת_יעד_כסף", "יעד_בכסף"]
+            if CAN_SEE_QTY:
+                allowed_cols += [
                     "מכירות_בכמות",
                     "ממוצע_חודשי_כמות_2025",
                     "תוספת_יעד_כמות",
@@ -1904,104 +1869,137 @@ with right:
                     "יעד_בכמות",
                     "יעד_חודשי_כמות_2026",
                 ]
-            else:
-                default_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
-            st.session_state[cols_pref_key] = [c for c in default_cols if c in allowed_cols]
+            allowed_cols = [c for c in all_possible_cols if c in set(allowed_cols)]
 
-        st.markdown("#### סינון עמודות לתצוגה")
-        picked_cols = st.multiselect(
-            "עמודות להצגה בטבלת עריכת יעדים (לקוח יחיד)",
-            options=allowed_cols,
-            default=st.session_state[cols_pref_key],
-            key=f"ms_{cols_pref_key}",
-        )
+            cols_pref_key = f"class_editor_cols::{context_username}::{context_agent_id}::{account}"
+            if cols_pref_key not in st.session_state:
+                if CAN_SEE_MONEY and CAN_SEE_QTY:
+                    default_cols = [
+                        "שם קוד מיון פריט",
+                        "מכירות_בכסף",
+                        "מכירות_בכמות",
+                        "ממוצע_חודשי_כמות_2025",
+                        "מחיר_ממוצע",
+                        "תוספת_יעד_כמות",
+                        "תוספת_חודשית_כמות",
+                        "תוספת_יעד_כסף",
+                        "יעד_בכסף",
+                        "יעד_בכמות",
+                        "יעד_חודשי_כמות_2026",
+                    ]
+                elif CAN_SEE_QTY:
+                    default_cols = [
+                        "שם קוד מיון פריט",
+                        "מכירות_בכמות",
+                        "ממוצע_חודשי_כמות_2025",
+                        "תוספת_יעד_כמות",
+                        "תוספת_חודשית_כמות",
+                        "יעד_בכמות",
+                        "יעד_חודשי_כמות_2026",
+                    ]
+                else:
+                    default_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
+                st.session_state[cols_pref_key] = [c for c in default_cols if c in allowed_cols]
 
-        must_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
-        for c in must_cols:
-            if c in allowed_cols and c not in picked_cols:
-                picked_cols.append(c)
-
-        st.session_state[cols_pref_key] = [c for c in allowed_cols if c in set(picked_cols)]
-
-        editor_df_full = base_df[st.session_state[cols_pref_key]].copy()
-
-        column_config = {"שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון", disabled=True)}
-        if "מכירות_בכסף" in editor_df_full.columns:
-            column_config["מכירות_בכסף"] = st.column_config.NumberColumn("מכירות (₪)", disabled=True, format="%.2f")
-        if "מכירות_בכמות" in editor_df_full.columns:
-            column_config["מכירות_בכמות"] = st.column_config.NumberColumn("כמות 2025", disabled=True, format="%.2f")
-        if "מחיר_ממוצע" in editor_df_full.columns:
-            column_config["מחיר_ממוצע"] = st.column_config.NumberColumn("מחיר ממוצע", disabled=True, format="%.2f")
-        if "ממוצע_חודשי_כמות_2025" in editor_df_full.columns:
-            column_config["ממוצע_חודשי_כמות_2025"] = st.column_config.NumberColumn(
-                "ממוצע חודשי (כמות) 2025", disabled=True, format="%.2f"
+            st.markdown("#### סינון עמודות לתצוגה")
+            picked_cols = st.multiselect(
+                "עמודות להצגה בטבלת עריכת יעדים (לקוח יחיד)",
+                options=allowed_cols,
+                default=st.session_state[cols_pref_key],
+                key=f"ms_{cols_pref_key}",
             )
 
-        column_config["תוספת_יעד_כמות"] = st.column_config.NumberColumn("תוספת יעד (כמות)", step=1.0, format="%.2f")
+            must_cols = ["שם קוד מיון פריט", "תוספת_יעד_כמות"]
+            for c in must_cols:
+                if c in allowed_cols and c not in picked_cols:
+                    picked_cols.append(c)
 
-        if "תוספת_חודשית_כמות" in editor_df_full.columns:
-            column_config["תוספת_חודשית_כמות"] = st.column_config.NumberColumn(
-                "תוספת חודשית (כמות)", disabled=True, format="%.2f"
-            )
-        if "תוספת_יעד_כסף" in editor_df_full.columns:
-            column_config["תוספת_יעד_כסף"] = st.column_config.NumberColumn("תוספת יעד (₪)", disabled=True, format="%.2f")
-        if "יעד_בכסף" in editor_df_full.columns:
-            column_config["יעד_בכסף"] = st.column_config.NumberColumn("2026 (₪)", disabled=True, format="%.2f")
-        if "יעד_בכמות" in editor_df_full.columns:
-            column_config["יעד_בכמות"] = st.column_config.NumberColumn("כמות 2026", disabled=True, format="%.2f")
-        if "יעד_חודשי_כמות_2026" in editor_df_full.columns:
-            column_config["יעד_חודשי_כמות_2026"] = st.column_config.NumberColumn(
-                "יעד חודשי 2026 (כמות)", disabled=True, format="%.2f"
-            )
+            st.session_state[cols_pref_key] = [c for c in allowed_cols if c in set(picked_cols)]
 
-        with st.form(key=f"targets_form::{context_username}::{context_agent_id}::{account}", clear_on_submit=False):
-            edited = st.data_editor(
-                editor_df_full,
-                hide_index=True,
-                use_container_width=True,
-                column_config=column_config,
-                key=f"class_editor::{context_username}::{context_agent_id}::{account}",
-            )
-            b1, b2 = st.columns([1, 1], gap="small")
-            with b1:
-                refresh_clicked = st.form_submit_button("רענן חישוב", use_container_width=True)
-            with b2:
-                save_clicked = st.form_submit_button("שמור למסד", use_container_width=True)
+            editor_df_full = base_df[st.session_state[cols_pref_key]].copy()
 
-        if refresh_clicked or save_clicked:
-            sales_qty_map = dict(
-                zip(
-                    base_df["שם קוד מיון פריט"].astype(str),
-                    pd.to_numeric(base_df.get("מכירות_בכמות", 0.0), errors="coerce").fillna(0.0),
+            column_config = {"שם קוד מיון פריט": st.column_config.TextColumn("שם קוד מיון", disabled=True)}
+            if "מכירות_בכסף" in editor_df_full.columns:
+                column_config["מכירות_בכסף"] = st.column_config.NumberColumn("מכירות (₪)", disabled=True, format="%.2f")
+            if "מכירות_בכמות" in editor_df_full.columns:
+                column_config["מכירות_בכמות"] = st.column_config.NumberColumn("כמות 2025", disabled=True, format="%.2f")
+            if "מחיר_ממוצע" in editor_df_full.columns:
+                column_config["מחיר_ממוצע"] = st.column_config.NumberColumn("מחיר ממוצע", disabled=True, format="%.2f")
+            if "ממוצע_חודשי_כמות_2025" in editor_df_full.columns:
+                column_config["ממוצע_חודשי_כמות_2025"] = st.column_config.NumberColumn(
+                    "ממוצע חודשי (כמות) 2025", disabled=True, format="%.2f"
                 )
-            )
 
-            edited["תוספת_יעד_כמות"] = pd.to_numeric(edited["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
+            column_config["תוספת_יעד_כמות"] = st.column_config.NumberColumn("תוספת יעד (כמות)", step=1.0, format="%.2f")
 
-            for _, r in edited.iterrows():
-                cls = str(r["שם קוד מיון פריט"])
-                dq = float(r["תוספת_יעד_כמות"] or 0.0)
+            if "תוספת_חודשית_כמות" in editor_df_full.columns:
+                column_config["תוספת_חודשית_כמות"] = st.column_config.NumberColumn(
+                    "תוספת חודשית (כמות)", disabled=True, format="%.2f"
+                )
+            if "תוספת_יעד_כסף" in editor_df_full.columns:
+                column_config["תוספת_יעד_כסף"] = st.column_config.NumberColumn("תוספת יעד (₪)", disabled=True, format="%.2f")
+            if "יעד_בכסף" in editor_df_full.columns:
+                column_config["יעד_בכסף"] = st.column_config.NumberColumn("2026 (₪)", disabled=True, format="%.2f")
+            if "יעד_בכמות" in editor_df_full.columns:
+                column_config["יעד_בכמות"] = st.column_config.NumberColumn("כמות 2026", disabled=True, format="%.2f")
+            if "יעד_חודשי_כמות_2026" in editor_df_full.columns:
+                column_config["יעד_חודשי_כמות_2026"] = st.column_config.NumberColumn(
+                    "יעד חודשי 2026 (כמות)", disabled=True, format="%.2f"
+                )
 
-                user_class_qty[(str(context_username), str(account), str(cls))] = dq
+            with st.form(key=f"targets_form::{context_username}::{context_agent_id}::{account}", clear_on_submit=False):
+                edited = st.data_editor(
+                    editor_df_full,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config=column_config,
+                    key=f"class_editor::{context_username}::{context_agent_id}::{account}",
+                )
+                b1, b2 = st.columns([1, 1], gap="small")
+                with b1:
+                    refresh_clicked = st.form_submit_button("רענן חישוב", use_container_width=True)
+                with b2:
+                    save_clicked = st.form_submit_button("שמור למסד", use_container_width=True)
 
-                if save_clicked:
-                    monthly_avg_2025_qty = float(sales_qty_map.get(cls, 0.0) or 0.0) / MONTHS_IN_YEAR
-                    monthly_add_qty = float(dq) / MONTHS_IN_YEAR
-                    db_upsert_user_class_qty(con, context_username, account, cls, dq, monthly_avg_2025_qty, monthly_add_qty)
+            if refresh_clicked or save_clicked:
+                sales_qty_map = dict(
+                    zip(
+                        base_df["שם קוד מיון פריט"].astype(str),
+                        pd.to_numeric(base_df.get("מכירות_בכמות", 0.0), errors="coerce").fillna(0.0),
+                    )
+                )
 
-            st.session_state[class_key] = user_class_qty
-            st.success("נשמר ועודכן." if save_clicked else "עודכן.")
-            st.rerun()
+                edited["תוספת_יעד_כמות"] = pd.to_numeric(edited["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
 
-        # ========= EDITABLE ITEMS =========
-        st.markdown("---")
+                for _, r in edited.iterrows():
+                    cls = str(r["שם קוד מיון פריט"])
+                    dq = float(r["תוספת_יעד_כמות"] or 0.0)
+
+                    user_class_qty[(str(context_username), str(account), str(cls))] = dq
+
+                    if save_clicked:
+                        monthly_avg_2025_qty = float(sales_qty_map.get(cls, 0.0) or 0.0) / MONTHS_IN_YEAR
+                        monthly_add_qty = float(dq) / MONTHS_IN_YEAR
+                        db_upsert_user_class_qty(con, context_username, account, cls, dq, monthly_avg_2025_qty, monthly_add_qty)
+
+                st.session_state[class_key] = user_class_qty
+                st.success("נשמר ועודכן." if save_clicked else "עודכן.")
+                st.rerun()
+
+            st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("---")
+
+        # ---------- Everyone: Items editor ----------
+        st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### פירוט פריטים (עריכה) — סינון לפי קוד מיון + חיפוש בשם פריט")
         st.caption("עריכת תוספת יעד לפי פריט מצטרפת לקוד המיון ומעדכנת KPI אוטומטית.")
 
         if COL_ITEM not in df_cust.columns:
             st.caption('לא נמצאה עמודה "שם פריט" בקובץ — לא ניתן להציג פירוט פריטים.')
+            st.markdown("</div>", unsafe_allow_html=True)
         elif not CAN_SEE_ITEM:
             st.caption('לפי הרשאות התצוגה, למשתמש רגיל אין גישה לעמודת "שם פריט".')
+            st.markdown("</div>", unsafe_allow_html=True)
         else:
             all_classes = sorted(df_cust[COL_CLASS].dropna().astype(str).unique().tolist()) if COL_CLASS in df_cust.columns else []
 
