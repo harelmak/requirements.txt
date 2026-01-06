@@ -1,16 +1,26 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.9.1 (FULL FILE)
+Uzeb Sales Targets — v8.10.0 (FULL FILE)
 
-Changes in v8.9.1 (per user requests):
+Changes (per requests):
 1) Regular user:
-   - Does NOT see "עריכת יעדים (לקוח יחיד)" (class-level editor)
-   - Sees ONLY the Items table (פריטים) (view-only) when a single customer is selected
-2) ADMIN:
-   - Can see and use "עריכת יעדים (לקוח יחיד)" (class-level editor)
-   - Can edit/save Items table (per-item deltas)
-3) Fix: When filtering by class (קבוצת/קוד מיון) in Items table, show ONLY items that belong to that class.
-   - Uses strict equality after normalization/strip on both sides
+   - Does NOT see "עריכת יעדים (לקוח יחיד)" (class table).
+   - Sees ONLY "פירוט פריטים" (items table) for single-customer view (view-only).
+2) Only ADMIN can edit:
+   - Class targets ("עריכת יעדים (לקוח יחיד)")
+   - Item targets (delta qty) in items table
+3) Items table:
+   - Fix strict filter by selected class: shows ONLY items belonging to the chosen class.
+   - Adds display mode:
+     a) Sold to customer (default)
+     b) Not sold to customer (exists in Uzeb/company file)
+     c) All (sold + not sold)
+4) To ensure regular users can see items table:
+   - ADMIN "visible columns" minimum now also includes COL_ITEM ("שם פריט") in addition to account+class.
+
+Important:
+- If hosting environment wipes local disk on restart (ephemeral filesystem), no SQLite code can
+  guarantee persistence. In that case you must mount a persistent volume or use an external DB.
 """
 
 import base64
@@ -1293,7 +1303,6 @@ with st.sidebar:
     except Exception:
         pass
 
-    # Warning if looks ephemeral (heuristic)
     if str(db_path.parent).lower().startswith(("/tmp", "c:\\windows\\temp")):
         st.warning("⚠️ נתיב ה-DB נראה זמני. לשמירה קבועה צריך תיקייה קבועה/Volume מתמשך.")
 
@@ -1334,7 +1343,6 @@ with st.sidebar:
         if not is_admin:
             st.caption(f"סוכן: {agent_label(st.session_state.get('agent_id'))}")
         if st.button("יציאה", use_container_width=True):
-            # No db_dir in session_state; safe to clear all.
             st.session_state.clear()
             st.rerun()
 
@@ -1429,7 +1437,10 @@ with st.sidebar:
         except Exception:
             pass
 
-        min_display = [COL_ACCOUNT, COL_CLASS]
+        # MINIMUM visible columns for regular users:
+        # - must include account + class + item to guarantee items table visibility.
+        min_display = [COL_ACCOUNT, COL_CLASS, COL_ITEM]
+
         current = [c for c in (USER_VISIBLE_COLS or []) if c in available_cols]
 
         picked = st.multiselect(
@@ -1675,7 +1686,7 @@ left, right = st.columns([1, 2], gap="large")
 with left:
     st.markdown('<div class="card">', unsafe_allow_html=True)
     st.markdown("### בחירת לקוחות (אופציונלי)")
-    st.caption("ברירת מחדל: לא נבחר לקוח → KPI מוצג עבור כל הטווח. לעריכת יעדים/פריטים בחר לקוח יחיד.")
+    st.caption("ברירת מחדל: לא נבחר לקוח → KPI מוצג עבור כל הטווח. לעריכת יעדים בחר לקוח יחיד.")
     st.session_state[sel_key] = st.multiselect(
         "לקוחות (מסודר לפי מכירות) — עם נתח ליד השם",
         options=customer_options,
@@ -1830,24 +1841,20 @@ with right:
     st.markdown("</div>", unsafe_allow_html=True)
 
     # =========================
-    # Single customer sections
+    # Single-customer view:
+    # - ADMIN: can edit class + items
+    # - Regular user: items only (view-only)
     # =========================
     if (not (IS_ADMIN and admin_company_wide)) and single:
         account = selected_customers[0]
         df_cust = df_scope.copy()
 
-        # Normalize class/item to avoid filter leakage/mismatch
-        if COL_CLASS in df_cust.columns:
-            df_cust[COL_CLASS] = df_cust[COL_CLASS].astype(str).str.strip()
-        if COL_ITEM in df_cust.columns:
-            df_cust[COL_ITEM] = df_cust[COL_ITEM].astype(str).str.strip()
-
-        # ---- ADMIN ONLY: class-level editor ("עריכת יעדים") ----
+        # ---------- ADMIN ONLY: CLASS EDIT ----------
         if IS_ADMIN:
             class_view = build_class_view(user_class_qty, user_item_qty, context_username, account, df_cust)
 
             st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown("### עריכת יעדים (לקוח יחיד) — ADMIN בלבד")
+            st.markdown("### עריכת יעדים (לקוח יחיד) — ADMIN")
             st.info("✏️ ערוך **תוספת יעד (כמות)**. שאר השדות מחושבים אוטומטית. (תוספות פריטים מצטרפות לקוד המיון)")
 
             base_df = class_view.sort_values("מכירות_בכסף", ascending=False).reset_index(drop=True)
@@ -1981,7 +1988,7 @@ with right:
                 edited["תוספת_יעד_כמות"] = pd.to_numeric(edited["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
 
                 for _, r in edited.iterrows():
-                    cls = str(r["שם קוד מיון פריט"]).strip()
+                    cls = str(r["שם קוד מיון פריט"])
                     dq = float(r["תוספת_יעד_כמות"] or 0.0)
 
                     user_class_qty[(str(context_username), str(account), str(cls))] = dq
@@ -1996,207 +2003,238 @@ with right:
 
             st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---- Items section: ADMIN edit / user view-only ----
+        # ---------- ITEMS (ADMIN edit / regular user view-only) ----------
         st.markdown('<div class="card">', unsafe_allow_html=True)
-
-        if IS_ADMIN:
-            st.markdown("### פירוט פריטים (עריכה) — סינון לפי קוד מיון + חיפוש בשם פריט")
-            st.caption("ADMIN יכול לערוך תוספת יעד לפי פריט. משתמש רגיל תצוגה בלבד.")
-        else:
-            st.markdown("### פירוט פריטים (תצוגה בלבד) — סינון לפי קוד מיון + חיפוש בשם פריט")
-            st.caption("משתמש רגיל: תצוגה בלבד (ללא עריכה).")
+        st.markdown("### פירוט פריטים — סינון לפי קוד מיון + חיפוש + פריטים שלא נמכרו ללקוח")
+        st.caption("ADMIN יכול לערוך תוספת יעד (כמות) לפי פריט. משתמש רגיל תצוגה בלבד.")
 
         if COL_ITEM not in df_cust.columns:
             st.caption('לא נמצאה עמודה "שם פריט" בקובץ — לא ניתן להציג פירוט פריטים.')
-        elif not CAN_SEE_ITEM:
-            st.caption('אין הרשאה לעמודת "שם פריט". ADMIN צריך לאפשר COL_ITEM בהגדרות התצוגה.')
+            st.markdown("</div>", unsafe_allow_html=True)
+        elif (not IS_ADMIN) and (not CAN_SEE_ITEM):
+            st.caption('לפי הרשאות תצוגה, המשתמש לא יכול לראות "שם פריט". ADMIN צריך לאפשר COL_ITEM (מינימום נשמר).')
+            st.markdown("</div>", unsafe_allow_html=True)
         else:
+            # Prepare base (customer rows)
             df_items_base = df_cust.copy()
-
-            # Strong normalization to avoid class leakage on filter
             df_items_base[COL_CLASS] = df_items_base[COL_CLASS].astype(str).str.strip()
             df_items_base[COL_ITEM] = df_items_base[COL_ITEM].astype(str).str.strip()
 
-            all_classes = sorted(df_items_base[COL_CLASS].dropna().astype(str).unique().tolist())
+            # 1) Aggregate items for selected customer
+            cust_items = df_items_base.copy()
+            cust_items = cust_items[cust_items[COL_CLASS].notna() & (cust_items[COL_CLASS] != "")].copy()
+            cust_items = cust_items[cust_items[COL_ITEM].notna() & (cust_items[COL_ITEM] != "")].copy()
 
-            f1, f2 = st.columns([1, 2], gap="small")
-            with f1:
-                cls_pick = st.selectbox(
-                    "סינון לפי קוד מיון",
-                    options=["(הכל)"] + all_classes,
-                    index=0,
-                    key=f"items_cls_pick::{context_username}::{context_agent_id}::{account}",
-                )
-            with f2:
-                item_search = st.text_input(
-                    "חיפוש בשם פריט (מכיל)",
-                    value="",
-                    key=f"items_search::{context_username}::{context_agent_id}::{account}",
-                )
+            cust_agg_map = {}
+            if CAN_SEE_MONEY:
+                cust_agg_map["cust_sales_money"] = (COL_NET, "sum")
+            if CAN_SEE_QTY:
+                cust_agg_map["cust_sales_qty"] = (COL_QTY, "sum")
 
-            items_df = df_items_base.copy()
-            items_df[COL_CLASS] = items_df[COL_CLASS].astype(str).str.strip()
-            items_df = items_df[items_df[COL_CLASS].notna() & (items_df[COL_CLASS] != "")].copy()
-
-            # STRICT equality filter (fix)
-            if cls_pick and cls_pick != "(הכל)":
-                pick = str(cls_pick).strip()
-                items_df = items_df[items_df[COL_CLASS].eq(pick)].copy()
-
-            if item_search.strip():
-                s = item_search.strip().lower()
-                items_df[COL_ITEM] = items_df[COL_ITEM].astype(str)
-                items_df = items_df[items_df[COL_ITEM].str.lower().str.contains(s, na=False)].copy()
-
-            if items_df.empty:
-                st.caption("אין פריטים שמתאימים לסינון הנוכחי.")
+            if not cust_agg_map:
+                st.caption("אין עמודות סכימה לתצוגה לפי ההרשאות הנוכחיות.")
+                st.markdown("</div>", unsafe_allow_html=True)
             else:
-                grp_cols = [COL_CLASS, COL_ITEM]
+                cust_g = cust_items.groupby([COL_CLASS, COL_ITEM], dropna=False).agg(**cust_agg_map).reset_index()
+                for c in ["cust_sales_money", "cust_sales_qty"]:
+                    if c in cust_g.columns:
+                        cust_g[c] = pd.to_numeric(cust_g[c], errors="coerce").fillna(0.0)
 
-                agg_map = {}
-                if CAN_SEE_MONEY:
-                    agg_map["מכירות_בכסף"] = (COL_NET, "sum")
-                if CAN_SEE_QTY:
-                    agg_map["מכירות_בכמות"] = (COL_QTY, "sum")
-
-                if not agg_map:
-                    st.caption("אין עמודות סכימה לתצוגה לפי ההרשאות הנוכחיות.")
+                # 2) Aggregate "all Uzeb" from company file
+                global_items = company_df.copy()
+                if COL_ITEM in global_items.columns:
+                    global_items[COL_CLASS] = global_items[COL_CLASS].astype(str).str.strip()
+                    global_items[COL_ITEM] = global_items[COL_ITEM].astype(str).str.strip()
+                    global_items = global_items[global_items[COL_CLASS].notna() & (global_items[COL_CLASS] != "")].copy()
+                    global_items = global_items[global_items[COL_ITEM].notna() & (global_items[COL_ITEM] != "")].copy()
                 else:
-                    g = items_df.groupby(grp_cols, dropna=False).agg(**agg_map).reset_index()
+                    global_items = pd.DataFrame(columns=[COL_CLASS, COL_ITEM, COL_NET, COL_QTY])
 
-                    if CAN_SEE_MONEY and CAN_SEE_QTY and "מכירות_בכסף" in g.columns and "מכירות_בכמות" in g.columns:
-                        g["מחיר_ממוצע"] = g.apply(
-                            lambda r: safe_div(float(r["מכירות_בכסף"]), float(r["מכירות_בכמות"])), axis=1
+                global_agg_map = {}
+                if CAN_SEE_MONEY:
+                    global_agg_map["uzeb_sales_money"] = (COL_NET, "sum")
+                if CAN_SEE_QTY:
+                    global_agg_map["uzeb_sales_qty"] = (COL_QTY, "sum")
+
+                global_g = global_items.groupby([COL_CLASS, COL_ITEM], dropna=False).agg(**global_agg_map).reset_index()
+                for c in ["uzeb_sales_money", "uzeb_sales_qty"]:
+                    if c in global_g.columns:
+                        global_g[c] = pd.to_numeric(global_g[c], errors="coerce").fillna(0.0)
+
+                # 3) Merge: what exists in Uzeb but not sold to customer
+                merged = global_g.merge(cust_g, on=[COL_CLASS, COL_ITEM], how="left")
+                for c in ["cust_sales_money", "cust_sales_qty"]:
+                    if c in merged.columns:
+                        merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0.0)
+
+                mode = st.radio(
+                    "מצב תצוגה",
+                    options=[
+                        "נמכר ללקוח (ברירת מחדל)",
+                        "לא נמכר ללקוח (קיים ביוזב)",
+                        "הכל (לקוח + לא נמכר)",
+                    ],
+                    index=0,
+                    horizontal=True,
+                    key=f"items_mode::{context_username}::{context_agent_id}::{account}",
+                )
+
+                all_classes = sorted(merged[COL_CLASS].dropna().astype(str).unique().tolist())
+                f1, f2 = st.columns([1, 2], gap="small")
+                with f1:
+                    cls_pick = st.selectbox(
+                        "סינון לפי קוד מיון",
+                        options=["(הכל)"] + all_classes,
+                        index=0,
+                        key=f"items_cls_pick::{context_username}::{context_agent_id}::{account}",
+                    )
+                with f2:
+                    item_search = st.text_input(
+                        "חיפוש בשם פריט (מכיל)",
+                        value="",
+                        key=f"items_search::{context_username}::{context_agent_id}::{account}",
+                    )
+
+                view_df = merged.copy()
+
+                # mode filter
+                if mode == "נמכר ללקוח (ברירת מחדל)":
+                    if "cust_sales_qty" in view_df.columns:
+                        view_df = view_df[view_df["cust_sales_qty"] > 0].copy()
+                    elif "cust_sales_money" in view_df.columns:
+                        view_df = view_df[view_df["cust_sales_money"] > 0].copy()
+                elif mode == "לא נמכר ללקוח (קיים ביוזב)":
+                    if "cust_sales_qty" in view_df.columns:
+                        view_df = view_df[view_df["cust_sales_qty"] == 0].copy()
+                    elif "cust_sales_money" in view_df.columns:
+                        view_df = view_df[view_df["cust_sales_money"] == 0].copy()
+
+                # STRICT class filter (fix)
+                if cls_pick and cls_pick != "(הכל)":
+                    pick = str(cls_pick).strip()
+                    view_df[COL_CLASS] = view_df[COL_CLASS].astype(str).str.strip()
+                    view_df = view_df[view_df[COL_CLASS].eq(pick)].copy()
+
+                # item search
+                if item_search.strip():
+                    s = item_search.strip().lower()
+                    view_df[COL_ITEM] = view_df[COL_ITEM].astype(str)
+                    view_df = view_df[view_df[COL_ITEM].str.lower().str.contains(s, na=False)].copy()
+
+                if view_df.empty:
+                    st.caption("אין פריטים שמתאימים לסינון/מצב שנבחר.")
+                    st.markdown("</div>", unsafe_allow_html=True)
+                else:
+                    # avg price: prefer customer price if has qty; else uzeb price
+                    if CAN_SEE_MONEY and CAN_SEE_QTY:
+                        view_df["cust_avg_price"] = view_df.apply(
+                            lambda r: safe_div(float(r.get("cust_sales_money", 0.0)), float(r.get("cust_sales_qty", 0.0)))
+                            if float(r.get("cust_sales_qty", 0.0) or 0.0) > 0 else math.nan,
+                            axis=1,
                         )
+                        view_df["uzeb_avg_price"] = view_df.apply(
+                            lambda r: safe_div(float(r.get("uzeb_sales_money", 0.0)), float(r.get("uzeb_sales_qty", 0.0)))
+                            if float(r.get("uzeb_sales_qty", 0.0) or 0.0) > 0 else math.nan,
+                            axis=1,
+                        )
+                        view_df["avg_price"] = view_df["cust_avg_price"].where(~view_df["cust_avg_price"].isna(), view_df["uzeb_avg_price"])
                     else:
-                        g["מחיר_ממוצע"] = math.nan
+                        view_df["avg_price"] = math.nan
 
                     def item_delta_row(r) -> float:
                         cls_v = str(r[COL_CLASS]).strip()
                         item_v = str(r[COL_ITEM])
                         return float(user_item_qty.get((str(context_username), str(account), cls_v, item_v), 0.0) or 0.0)
 
-                    g["תוספת_יעד_כמות"] = g.apply(item_delta_row, axis=1)
+                    view_df["delta_qty"] = view_df.apply(item_delta_row, axis=1)
 
-                    if "מכירות_בכמות" in g.columns:
-                        g["יעד_בכמות"] = (
-                            pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0)
-                            + pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
-                        )
-                    else:
-                        g["יעד_בכמות"] = pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
+                    base_qty = pd.to_numeric(view_df.get("cust_sales_qty", 0.0), errors="coerce").fillna(0.0)
+                    view_df["target_qty"] = base_qty + pd.to_numeric(view_df["delta_qty"], errors="coerce").fillna(0.0)
+                    view_df["monthly_avg_2025_qty"] = base_qty / MONTHS_IN_YEAR
+                    view_df["monthly_add_qty"] = pd.to_numeric(view_df["delta_qty"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
+                    view_df["monthly_target_2026_qty"] = pd.to_numeric(view_df["target_qty"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
 
-                    if CAN_SEE_MONEY and "מכירות_בכסף" in g.columns:
-                        dm = (
-                            pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0)
-                            * pd.to_numeric(g["מחיר_ממוצע"], errors="coerce").fillna(0.0)
-                        )
-                        g["תוספת_יעד_כסף"] = dm
-                        g["יעד_בכסף"] = pd.to_numeric(g["מכירות_בכסף"], errors="coerce").fillna(0.0) + dm
+                    if CAN_SEE_MONEY:
+                        view_df["delta_money"] = pd.to_numeric(view_df["delta_qty"], errors="coerce").fillna(0.0) * pd.to_numeric(
+                            view_df["avg_price"], errors="coerce"
+                        ).fillna(0.0)
+                        cust_money = pd.to_numeric(view_df.get("cust_sales_money", 0.0), errors="coerce").fillna(0.0)
+                        view_df["target_money"] = cust_money + view_df["delta_money"]
 
-                    if "מכירות_בכמות" in g.columns:
-                        g["ממוצע_חודשי_כמות_2025"] = (
-                            pd.to_numeric(g["מכירות_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
-                        )
-                    else:
-                        g["ממוצע_חודשי_כמות_2025"] = 0.0
+                    disp = view_df.rename(columns={COL_CLASS: "קוד מיון", COL_ITEM: "שם פריט"}).copy()
 
-                    g["תוספת_חודשית_כמות"] = pd.to_numeric(g["תוספת_יעד_כמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
-                    g["יעד_חודשי_כמות_2026"] = pd.to_numeric(g["יעד_בכמות"], errors="coerce").fillna(0.0) / MONTHS_IN_YEAR
+                    cols = ["קוד מיון", "שם פריט"]
+                    if CAN_SEE_QTY:
+                        cols += ["cust_sales_qty", "monthly_avg_2025_qty", "delta_qty", "monthly_add_qty", "target_qty", "monthly_target_2026_qty", "uzeb_sales_qty"]
+                    if CAN_SEE_MONEY:
+                        cols += ["cust_sales_money", "avg_price", "delta_money", "target_money", "uzeb_sales_money"]
 
-                    disp = g.rename(columns={COL_CLASS: "קוד מיון", COL_ITEM: "שם פריט"}).copy()
+                    cols = [c for c in cols if c in disp.columns]
 
-                    # Extra safety: enforce class filter again post-rename
-                    if cls_pick and cls_pick != "(הכל)":
-                        pick = str(cls_pick).strip()
-                        disp["קוד מיון"] = disp["קוד מיון"].astype(str).str.strip()
-                        disp = disp[disp["קוד מיון"].eq(pick)].copy()
-
-                    sort_col = "מכירות_בכסף" if ("מכירות_בכסף" in disp.columns) else (
-                        "מכירות_בכמות" if "מכירות_בכמות" in disp.columns else "תוספת_יעד_כמות"
+                    sort_col = "cust_sales_money" if ("cust_sales_money" in disp.columns and CAN_SEE_MONEY) else (
+                        "cust_sales_qty" if ("cust_sales_qty" in disp.columns and CAN_SEE_QTY) else "uzeb_sales_money"
                     )
-                    disp = disp.sort_values(sort_col, ascending=False).reset_index(drop=True)
-
-                    editor_cols = ["קוד מיון", "שם פריט"]
-                    if "מכירות_בכמות" in disp.columns:
-                        editor_cols += ["מכירות_בכמות", "ממוצע_חודשי_כמות_2025"]
-                    editor_cols += ["תוספת_יעד_כמות", "תוספת_חודשית_כמות", "יעד_בכמות", "יעד_חודשי_כמות_2026"]
-                    if CAN_SEE_MONEY and "מכירות_בכסף" in disp.columns:
-                        editor_cols += ["מכירות_בכסף", "מחיר_ממוצע", "תוספת_יעד_כסף", "יעד_בכסף"]
-                    editor_cols = [c for c in editor_cols if c in disp.columns]
+                    if sort_col in disp.columns:
+                        disp = disp.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
                     item_cfg = {
                         "קוד מיון": st.column_config.TextColumn("קוד מיון", disabled=True),
                         "שם פריט": st.column_config.TextColumn("שם פריט", disabled=True),
-                        "תוספת_יעד_כמות": st.column_config.NumberColumn(
-                            "תוספת יעד (כמות) — לפי פריט",
-                            step=1.0,
-                            format="%.2f",
-                            disabled=(not IS_ADMIN),
-                        ),
-                        "תוספת_חודשית_כמות": st.column_config.NumberColumn("תוספת חודשית (כמות)", disabled=True, format="%.2f"),
-                        "יעד_בכמות": st.column_config.NumberColumn("כמות 2026", disabled=True, format="%.2f"),
-                        "יעד_חודשי_כמות_2026": st.column_config.NumberColumn("יעד חודשי 2026 (כמות)", disabled=True, format="%.2f"),
+                        "cust_sales_qty": st.column_config.NumberColumn("כמות אצל הלקוח (2025)", disabled=True, format="%.2f"),
+                        "cust_sales_money": st.column_config.NumberColumn("מכירות אצל הלקוח (₪)", disabled=True, format="%.2f"),
+                        "uzeb_sales_qty": st.column_config.NumberColumn("כמות ביוזב (כללי)", disabled=True, format="%.2f"),
+                        "uzeb_sales_money": st.column_config.NumberColumn("מכירות ביוזב (₪, כללי)", disabled=True, format="%.2f"),
+                        "avg_price": st.column_config.NumberColumn("מחיר ממוצע (לקוח/יוזב)", disabled=True, format="%.2f"),
+                        "delta_qty": st.column_config.NumberColumn("תוספת יעד (כמות)", disabled=(not IS_ADMIN), step=1.0, format="%.2f"),
+                        "monthly_avg_2025_qty": st.column_config.NumberColumn("ממוצע חודשי (כמות) 2025", disabled=True, format="%.2f"),
+                        "monthly_add_qty": st.column_config.NumberColumn("תוספת חודשית (כמות)", disabled=True, format="%.2f"),
+                        "target_qty": st.column_config.NumberColumn("יעד כמות 2026", disabled=True, format="%.2f"),
+                        "monthly_target_2026_qty": st.column_config.NumberColumn("יעד חודשי כמות 2026", disabled=True, format="%.2f"),
+                        "delta_money": st.column_config.NumberColumn("תוספת יעד (₪)", disabled=True, format="%.2f"),
+                        "target_money": st.column_config.NumberColumn("יעד (₪) 2026", disabled=True, format="%.2f"),
                     }
-                    if "מכירות_בכמות" in disp.columns:
-                        item_cfg["מכירות_בכמות"] = st.column_config.NumberColumn("כמות 2025", disabled=True, format="%.2f")
-                        item_cfg["ממוצע_חודשי_כמות_2025"] = st.column_config.NumberColumn("ממוצע חודשי (כמות) 2025", disabled=True, format="%.2f")
-
-                    if CAN_SEE_MONEY:
-                        if "מכירות_בכסף" in disp.columns:
-                            item_cfg["מכירות_בכסף"] = st.column_config.NumberColumn("מכירות (₪)", disabled=True, format="%.2f")
-                        if "מחיר_ממוצע" in disp.columns:
-                            item_cfg["מחיר_ממוצע"] = st.column_config.NumberColumn("מחיר ממוצע", disabled=True, format="%.2f")
-                        if "תוספת_יעד_כסף" in disp.columns:
-                            item_cfg["תוספת_יעד_כסף"] = st.column_config.NumberColumn("תוספת יעד (₪)", disabled=True, format="%.2f")
-                        if "יעד_בכסף" in disp.columns:
-                            item_cfg["יעד_בכסף"] = st.column_config.NumberColumn("2026 (₪)", disabled=True, format="%.2f")
 
                     if IS_ADMIN:
-                        with st.form(key=f"items_form::{context_username}::{context_agent_id}::{account}", clear_on_submit=False):
+                        with st.form(key=f"items_form::{context_username}::{context_agent_id}::{account}::mode2", clear_on_submit=False):
                             edited_items = st.data_editor(
-                                disp[editor_cols],
+                                disp[cols],
                                 hide_index=True,
                                 use_container_width=True,
                                 column_config=item_cfg,
-                                key=f"items_editor::{context_username}::{context_agent_id}::{account}::{cls_pick}::{item_search}",
+                                key=f"items_editor::{context_username}::{context_agent_id}::{account}::{mode}::{cls_pick}::{item_search}",
                             )
                             c1, c2 = st.columns([1, 1], gap="small")
                             with c1:
-                                items_refresh = st.form_submit_button("רענן חישוב פריטים", use_container_width=True)
+                                _ = st.form_submit_button("רענן חישוב פריטים", use_container_width=True)
                             with c2:
                                 items_save = st.form_submit_button("שמור פריטים למסד", use_container_width=True)
 
-                        if items_refresh or items_save:
-                            edited_items["תוספת_יעד_כמות"] = pd.to_numeric(
-                                edited_items["תוספת_יעד_כמות"], errors="coerce"
-                            ).fillna(0.0)
-
+                        if items_save:
+                            edited_items["delta_qty"] = pd.to_numeric(edited_items["delta_qty"], errors="coerce").fillna(0.0)
                             for _, rr in edited_items.iterrows():
                                 cls_val = str(rr["קוד מיון"]).strip()
                                 item_val = str(rr["שם פריט"])
-                                dq = float(rr["תוספת_יעד_כמות"] or 0.0)
+                                dq = float(rr["delta_qty"] or 0.0)
 
                                 user_item_qty[(str(context_username), str(account), str(cls_val), str(item_val))] = dq
 
-                                if items_save:
-                                    sales_year_qty = float(rr.get("מכירות_בכמות", 0.0) or 0.0)
-                                    monthly_avg_2025_qty = sales_year_qty / MONTHS_IN_YEAR
-                                    monthly_add_qty = dq / MONTHS_IN_YEAR
-                                    db_upsert_user_item_qty(
-                                        con,
-                                        context_username,
-                                        account,
-                                        cls_val,
-                                        item_val,
-                                        dq,
-                                        monthly_avg_2025_qty,
-                                        monthly_add_qty,
-                                    )
+                                sales_year_qty = float(rr.get("cust_sales_qty", 0.0) or 0.0)
+                                monthly_avg_2025_qty = sales_year_qty / MONTHS_IN_YEAR
+                                monthly_add_qty = dq / MONTHS_IN_YEAR
+                                db_upsert_user_item_qty(
+                                    con,
+                                    context_username,
+                                    account,
+                                    cls_val,
+                                    item_val,
+                                    dq,
+                                    monthly_avg_2025_qty,
+                                    monthly_add_qty,
+                                )
 
                             st.session_state[item_key] = user_item_qty
                             st.rerun()
                     else:
-                        st.dataframe(disp[editor_cols], use_container_width=True, hide_index=True)
+                        st.dataframe(disp[cols], use_container_width=True, hide_index=True)
 
-        st.markdown("</div>", unsafe_allow_html=True)
+                    st.markdown("</div>", unsafe_allow_html=True)
