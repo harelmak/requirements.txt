@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v8.9.6 (MULTIMEDIA FIX)
+Uzeb Sales Targets — v8.9.8 (ULTIMATE DATABASE PURGE)
 """
 
 import sqlite3
 import pandas as pd
 import streamlit as st
 import os
+import gc  # Garbage Collector לניקוי זיכרון
 
 # =========================
 # הגדרות קבועות
@@ -17,163 +18,111 @@ DB_FILE = "uzeb_data.db"
 
 st.set_page_config(page_title="Uzeb — Targets", layout="wide")
 
-# עיצוב RTL ושיפור נראות הטבלה
-st.markdown("""
-<style>
-    html, body, [class*='css'] { direction: rtl; text-align: right; }
-    .stDataFrame { border: 1px solid #ff4b4b; border-radius: 5px; }
-</style>
-""", unsafe_allow_html=True)
+# עיצוב RTL
+st.markdown("<style>html, body, [class*='css'] { direction: rtl; text-align: right; }</style>", unsafe_allow_html=True)
 
 # =========================
-# פונקציות ניהול נתונים
+# פונקציות ניקוי וסנכרון (סעיף 2 המורחב)
 # =========================
 
-def get_connection():
-    return sqlite3.connect(DB_FILE)
-
-def force_sync_database(uploaded_file):
+def hard_reset_and_upload(uploaded_file):
     """
-    מבצע ניקוי טוטאלי של בסיס הנתונים וטעינה נקייה מהאקסל
+    מבצע מחיקה פיזית של הקובץ וניקוי זיכרון לפני טעינה חדשה
     """
     try:
-        # 1. קריאת האקסל
-        df = pd.read_excel(uploaded_file)
-        
-        # 2. ניקוי נתונים: הסרת רווחים כפולים או מיותרים שגורמים לכפילויות במולטימדיה
-        # זה מוודא ש "מולטימדיה " ו-"מולטימדיה" ייחשבו כאותו דבר
-        df = df.applymap(lambda x: " ".join(x.split()) if isinstance(x, str) else x)
-        
-        # 3. מחיקת כפילויות ברמת ה-DataFrame לפני הכניסה ל-DB
-        df = df.drop_duplicates()
+        # 1. קריאת הקובץ החדש לזיכרון לפני שנוגעים ב-DB
+        df_new = pd.read_excel(uploaded_file)
+        df_new = df_new.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        df_new = df_new.drop_duplicates()
 
-        with get_connection() as conn:
-            # 4. מחיקה פיזית של הטבלה הקיימת (DROP)
-            cursor = conn.cursor()
-            cursor.execute("DROP TABLE IF EXISTS sales_targets")
-            conn.commit()
-            
-            # 5. כתיבה מחדש של הנתונים הנקיים
-            df.to_sql("sales_targets", conn, if_exists="replace", index=False)
-            
-        # 6. ניקוי ה-Cache של Streamlit
+        # 2. ניקוי ה-Cache של Streamlit (חשוב מאוד!)
         st.cache_data.clear()
         
-        return True, f"בוצע סנכרון מלא! {len(df)} שורות נטענו בצורה נקייה."
+        # 3. סגירת כל החיבורים ומחיקת קובץ ה-DB הקיים מהדיסק
+        if os.path.exists(DB_FILE):
+            # ניסיון למחוק את הקובץ פיזית כדי להבטיח שאין זכר לנתונים ישנים
+            try:
+                os.remove(DB_FILE)
+            except:
+                # אם הקובץ נעול, נרוקן את הטבלה ידנית בשיטה אגרסיבית
+                with sqlite3.connect(DB_FILE) as conn:
+                    conn.execute("DROP TABLE IF EXISTS sales_targets")
+                    conn.execute("VACUUM") # דחיסת הקובץ ומחיקת תוכן פיזי
+                
+        # 4. יצירת בסיס נתונים חדש לגמרי מהאקסל הנקי
+        with sqlite3.connect(DB_FILE) as conn:
+            df_new.to_sql("sales_targets", conn, if_exists="replace", index=False)
+        
+        return True, f"בוצע איפוס קשיח! נטענו {len(df_new)} שורות מהאקסל בלבד."
     except Exception as e:
-        return False, f"שגיאה בתהליך הסנכרון: {e}"
+        return False, f"שגיאה קריטית: {e}"
 
-def load_clean_data():
+def load_data():
     @st.cache_data
     def fetch():
+        if not os.path.exists(DB_FILE):
+            return pd.DataFrame()
         try:
-            with get_connection() as conn:
+            with sqlite3.connect(DB_FILE) as conn:
                 return pd.read_sql("SELECT * FROM sales_targets", conn)
         except:
             return pd.DataFrame()
     return fetch()
 
 # =========================
-# ממשק משתמש
+# ממשק המערכת
 # =========================
-def check_auth():
+def main():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     
     if not st.session_state.authenticated:
         st.title("התחברות למערכת Uzeb")
-        col1, col2 = st.columns(2)
-        with col1:
-            user = st.text_input("שם משתמש")
-            pwd = st.text_input("סיסמה", type="password")
-            if st.button("כניסה למערכת"):
-                if user == ADMIN_USERNAME and pwd == ADMIN_PASSWORD:
-                    st.session_state.authenticated = True
-                    st.session_state.username = ADMIN_USERNAME
-                    st.rerun()
-                elif user != "" and pwd != "":
-                    st.session_state.authenticated = True
-                    st.session_state.username = user
-                    st.rerun()
-                else:
-                    st.error("פרטי גישה שגויים")
-        return False
-    return True
-
-def main():
-    if not check_auth():
+        u = st.text_input("שם משתמש")
+        p = st.text_input("סיסמה", type="password")
+        if st.button("כניסה"):
+            if u == ADMIN_USERNAME and p == ADMIN_PASSWORD:
+                st.session_state.authenticated = True
+                st.rerun()
         return
 
-    st.sidebar.subheader(f"שלום, {st.session_state.username}")
-    if st.sidebar.button("יציאה מהמערכת"):
-        st.session_state.authenticated = False
-        st.rerun()
+    # תפריט עליון
+    tabs = st.tabs(["📊 דאשבורד", "🔍 רשימת מוצרים", "🛑 ניהול ואיפוס (ADMIN)"])
 
-    is_admin = (st.session_state.username == ADMIN_USERNAME)
-    
-    # טאבים
-    tab_list = ["📊 דאשבורד", "📋 רשימת יעדים"]
-    if is_admin:
-        tab_list.append("⚙️ הגדרות מנהל")
-    
-    tabs = st.tabs(tab_list)
-
-    # טאב דאשבורד
     with tabs[0]:
-        st.header("מצב יעדים נוכחי")
-        df = load_clean_data()
+        st.header("סיכום נתונים")
+        df = load_data()
         if not df.empty:
-            st.info(f"מציג נתונים מעודכנים עבור {len(df)} פריטים.")
-            # כאן אפשר להוסיף גרפים
+            st.success(f"כרגע מוצגות {len(df)} שורות בבסיס הנתונים.")
         else:
-            st.warning("בסיס הנתונים ריק. נא לפנות למנהל לטעינת אקסל.")
+            st.warning("אין נתונים במערכת.")
 
-    # טאב צפייה
     with tabs[1]:
-        st.header("פירוט מוצרים ויעדים")
-        df = load_clean_data()
+        st.header("תצוגת נתונים מה-DB")
+        df = load_data()
         if not df.empty:
-            # הוספת תיבת סינון לחיפוש מהיר של מולטימדיה
-            search = st.text_input("חיפוש מוצר (לדוגמה: מולטימדיה):")
-            if search:
-                df = df[df.apply(lambda row: search in str(row.values), axis=1)]
-            st.dataframe(df, use_container_width=True, height=500)
+            st.dataframe(df, use_container_width=True)
         else:
-            st.write("אין נתונים להצגה.")
+            st.info("בסיס הנתונים ריק.")
 
-    # טאב ניהול (ADMIN)
-    if is_admin:
-        with tabs[2]:
-            st.header("⚙️ ממשק ניהול ובקרה")
-            
-            st.subheader("עדכון נתונים מאקסל")
-            st.markdown("""
-            **הנחיות:**
-            1. העלאת קובץ תמחוק את כל המידע הקיים בטבלה.
-            2. המערכת תנקה כפילויות ורווחים מיותרים באופן אוטומטי.
-            """)
-            
-            file = st.file_uploader("בחר קובץ XLSX", type=["xlsx"])
-            if st.button("🔥 בצע דריסה ועדכון נתונים"):
-                if file:
-                    with st.spinner("מנקה בסיס נתונים וטוען מחדש..."):
-                        success, msg = force_sync_database(file)
-                        if success:
-                            st.success(msg)
-                            st.balloons()
-                            st.rerun()
-                        else:
-                            st.error(msg)
-                else:
-                    st.error("חובה לבחור קובץ אקסל.")
-            
-            st.divider()
-            if st.button("❌ מחיקת כל הנתונים (Reset)"):
-                if os.path.exists(DB_FILE):
-                    os.remove(DB_FILE)
-                    st.cache_data.clear()
-                    st.success("בסיס הנתונים נמחק פיזית.")
+    with tabs[2]:
+        st.header("מנגנון איפוס בסיס נתונים")
+        st.error("שים לב: פעולה זו תמחוק את קובץ ה-DB הקיים ותבנה אותו מחדש רק מהאקסל שתעלה.")
+        
+        file = st.file_uploader("העלה אקסל (XLSX) - וודא שזה הקובץ הנקי", type=["xlsx"])
+        
+        if st.button("🔥 בצע איפוס קשיח וטעינה מחדש"):
+            if file:
+                success, msg = hard_reset_and_upload(file)
+                if success:
+                    st.success(msg)
+                    st.balloons()
+                    # השהיה קלה וריענון
                     st.rerun()
+                else:
+                    st.error(msg)
+            else:
+                st.warning("נא לבחור קובץ אקסל.")
 
 if __name__ == "__main__":
     main()
