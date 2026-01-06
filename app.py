@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v9.2.0 (CLEAN SYNC & DYNAMIC FILTER)
+Uzeb Sales Targets — v9.3.0 (BACK TO CLASSIC + FIX)
 """
 
 import sqlite3
 import pandas as pd
 import streamlit as st
-import os
+from pathlib import Path
 
 # =========================
 # הגדרות קבועות
@@ -17,67 +17,29 @@ DB_FILE = "uzeb_data.db"
 
 st.set_page_config(page_title="Uzeb — Targets", layout="wide")
 
-# עיצוב RTL (תמיכה בעברית)
-st.markdown("""
-<style>
-    html, body, [class*='css'] { direction: rtl; text-align: right; }
-    .stSelectbox label { font-size: 20px !important; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
+# עיצוב RTL בסיסי
+st.markdown("<style>html, body, [class*='css'] { direction: rtl; text-align: right; }</style>", unsafe_allow_html=True)
 
 # =========================
-# פונקציות ליבה (שלב 2 - ניקוי ואיפוס)
+# פונקציות בסיס
 # =========================
-
 def get_connection():
     return sqlite3.connect(DB_FILE)
 
-def refresh_database_from_excel(uploaded_file):
-    """
-    מבצע מחיקה מוחלטת של הנתונים הישנים וטעינה נקייה בלבד.
-    """
-    try:
-        # קריאת הגיליון הראשון מהאקסל
-        df = pd.read_excel(uploaded_file, sheet_name=0)
-        
-        # ניקוי בסיסי: הסרת שורות ריקות ורווחים מיותרים בשמות הקטגוריות
-        df = df.dropna(how='all')
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
-
-        with get_connection() as conn:
-            # שלב 2: מחיקת הטבלה הקיימת ויצירתה מחדש (DROP)
-            # זה מבטיח שנתונים שלא קיימים באקסל לא יופיעו ב-DB
-            conn.execute("DROP TABLE IF EXISTS sales_targets")
-            df.to_sql("sales_targets", conn, if_exists="replace", index=False)
-            conn.execute("VACUUM") # ניקוי פיזי של הדיסק
-            
-        st.cache_data.clear() # ניקוי ה-Cache של השרת
-        return True, f"הנתונים רועננו! נטענו {len(df)} שורות מהקובץ החדש."
-    except Exception as e:
-        return False, f"שגיאה בעדכון: {e}"
-
-def load_data():
-    if not os.path.exists(DB_FILE):
-        return pd.DataFrame()
-    with get_connection() as conn:
-        try:
-            return pd.read_sql("SELECT * FROM sales_targets", conn)
-        except:
-            return pd.DataFrame()
-
-# =========================
-# ניהול הרשאות
-# =========================
 def check_auth():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     
     if not st.session_state.authenticated:
-        st.title("מערכת ניהול יעדים Uzeb")
+        st.title("התחברות למערכת Uzeb")
         user = st.text_input("שם משתמש")
         pwd = st.text_input("סיסמה", type="password")
         if st.button("התחבר"):
-            if (user == ADMIN_USERNAME and pwd == ADMIN_PASSWORD) or (user != "" and pwd != ""):
+            if user == ADMIN_USERNAME and pwd == ADMIN_PASSWORD:
+                st.session_state.authenticated = True
+                st.session_state.username = ADMIN_USERNAME
+                st.rerun()
+            elif user != "" and pwd != "":
                 st.session_state.authenticated = True
                 st.session_state.username = user
                 st.rerun()
@@ -86,9 +48,6 @@ def check_auth():
         return False
     return True
 
-# =========================
-# ממשק המערכת
-# =========================
 def main():
     if not check_auth():
         return
@@ -98,78 +57,72 @@ def main():
         st.session_state.authenticated = False
         st.rerun()
 
+    # טעינת נתונים
+    try:
+        with get_connection() as conn:
+            df = pd.read_sql("SELECT * FROM sales_targets", conn)
+    except:
+        df = pd.DataFrame()
+
+    # --- ניהול טאבים לפי הרשאות (המבנה המקורי) ---
+    tab_list = ["דאשבורד", "צפייה בנתונים"]
     is_admin = (st.session_state.username == ADMIN_USERNAME)
-    
-    # טאבים לפי הרשאות
-    tab_list = ["📊 תצוגת יעדים", "📑 צפייה בנתונים"]
     if is_admin:
-        tab_list.append("⚙️ ניהול אדמין (איפוס וטעינה)")
+        tab_list.append("עריכת יעדים (לקוח יחיד)")
 
     tabs = st.tabs(tab_list)
 
-    # --- טאב 1: תצוגת יעדים עם סינון דינמי ---
+    # --- טאב 1: דאשבורד ---
     with tabs[0]:
-        st.header("🔍 סינון לפי קבוצת מיון")
-        df = load_data()
-        
-        if df.empty:
-            st.warning("אין נתונים בבסיס הנתונים. מנהל צריך לטעון קובץ אקסל.")
+        st.header("לוח בקרה")
+        if not df.empty:
+            st.write(f"סה''כ שורות במערכת: {len(df)}")
         else:
-            # זיהוי עמודת הסינון (מניחים שקוראים לה 'קבוצת מיון')
-            filter_col = "קבוצת מיון" if "קבוצת מיון" in df.columns else df.columns[0]
-            
-            # רשימת קטגוריות ייחודיות
-            options = sorted(df[filter_col].unique().tolist())
-            
-            # תיבת הבחירה - הסינון הדינמי
-            selected = st.selectbox("בחר קבוצה להצגה:", ["הצג הכל"] + options)
+            st.write("אין נתונים להצגה.")
 
-            # פילטור הטבלה
-            if selected != "הצג הכל":
-                filtered_df = df[df[filter_col] == selected]
-            else:
-                filtered_df = df
-
-            st.write(f"מציג **{len(filtered_df)}** שורות:")
-            st.dataframe(filtered_df, use_container_width=True, height=500)
-
-    # --- טאב 2: צפייה בנתונים (View Only) ---
+    # --- טאב 2: צפייה בנתונים (כאן ביצעתי את תיקון הסינון) ---
     with tabs[1]:
-        st.header("נתוני מכירות מלאים")
-        full_df = load_data()
-        if not full_df.empty:
-            st.dataframe(full_df, use_container_width=True)
+        st.header("נתוני מכירות")
+        if not df.empty:
+            # סינון לפי קבוצת מיון
+            col_name = "קבוצת מיון" if "קבוצת מיון" in df.columns else df.columns[0]
+            categories = sorted(df[col_name].unique().tolist())
+            
+            selected_cat = st.selectbox("סנן לפי קבוצת מיון:", ["הצג הכל"] + categories)
+            
+            if selected_cat != "הצג הכל":
+                display_df = df[df[col_name] == selected_cat]
+            else:
+                display_df = df
+                
+            st.dataframe(display_df, use_container_width=True)
         else:
-            st.info("בסיס הנתונים ריק.")
+            st.info("כאן כולם רואים נתונים ב-View Only. כרגע אין נתונים.")
 
-    # --- טאב 3: ניהול אדמין (שלב 2) ---
+    # --- טאב 3: עריכת יעדים (ADMIN בלבד - טעינה מחדש נקייה) ---
     if is_admin:
         with tabs[2]:
-            st.header("⚙️ ממשק ניהול - איפוס וסנכרון")
-            st.info("כאן ניתן לנקות את המערכת מנתונים ישנים ולהעלות אקסל חדש.")
+            st.header("🔧 ניהול נתונים")
             
-            uploaded_file = st.file_uploader("בחר קובץ אקסל מעודכן (XLSX)", type=["xlsx"])
-            
-            if st.button("🔥 בצע איפוס קשיח וטעינה מחדש"):
+            # אפשרות העלאת קובץ חדש (החלפה נקייה)
+            uploaded_file = st.file_uploader("העלה קובץ אקסל חדש (xlsx)", type="xlsx")
+            if st.button("עדכן נתונים ודרוס קודמים"):
                 if uploaded_file:
-                    with st.spinner("מנקה בסיס נתונים וטוען מחדש..."):
-                        success, msg = refresh_database_from_excel(uploaded_file)
-                        if success:
-                            st.success(msg)
-                            st.balloons()
-                            st.rerun()
-                        else:
-                            st.error(msg)
-                else:
-                    st.warning("נא לבחור קובץ תחילה.")
-
-            st.divider()
-            if st.button("🗑️ מחיקת בסיס נתונים לצמיתות"):
-                if os.path.exists(DB_FILE):
-                    os.remove(DB_FILE)
-                    st.cache_data.clear()
-                    st.success("קובץ ה-Database נמחק. המערכת ריקה.")
+                    new_df = pd.read_excel(uploaded_file)
+                    with get_connection() as conn:
+                        # שימוש ב-replace מבטיח שהנתונים הישנים נמחקים
+                        new_df.to_sql("sales_targets", conn, if_exists="replace", index=False)
+                    st.success("הנתונים עודכנו בהצלחה!")
                     st.rerun()
+            
+            st.write("---")
+            st.write("טבלת עריכה ידנית:")
+            if not df.empty:
+                edited_df = st.data_editor(df)
+                if st.button("שמור שינויים בטבלה"):
+                    with get_connection() as conn:
+                        edited_df.to_sql("sales_targets", conn, if_exists="replace", index=False)
+                    st.success("השינויים נשמרו!")
 
 if __name__ == "__main__":
     main()
