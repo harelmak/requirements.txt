@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Uzeb Sales Targets — v9.3.0 (BACK TO CLASSIC + FIX)
+Uzeb Sales Targets — v8.9.3 (FINAL ADMIN LOCK)
 """
 
 import sqlite3
@@ -13,7 +13,6 @@ from pathlib import Path
 # =========================
 ADMIN_USERNAME = "ADMIN"
 ADMIN_PASSWORD = "1511!!"
-DB_FILE = "uzeb_data.db"
 
 st.set_page_config(page_title="Uzeb — Targets", layout="wide")
 
@@ -23,9 +22,6 @@ st.markdown("<style>html, body, [class*='css'] { direction: rtl; text-align: rig
 # =========================
 # פונקציות בסיס
 # =========================
-def get_connection():
-    return sqlite3.connect(DB_FILE)
-
 def check_auth():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -57,72 +53,43 @@ def main():
         st.session_state.authenticated = False
         st.rerun()
 
-    # טעינת נתונים
-    try:
-        with get_connection() as conn:
-            df = pd.read_sql("SELECT * FROM sales_targets", conn)
-    except:
-        df = pd.DataFrame()
-
-    # --- ניהול טאבים לפי הרשאות (המבנה המקורי) ---
+    # ==========================================
+    # ניהול טאבים לפי הרשאות - כאן השינוי המרכזי!
+    # ==========================================
+    
+    # 1. הגדרת רשימת הטאבים הזמינים
     tab_list = ["דאשבורד", "צפייה בנתונים"]
+    
+    # רק אם המשתמש הוא ADMIN, נוסיף את הטאב של עריכת יעדים
     is_admin = (st.session_state.username == ADMIN_USERNAME)
     if is_admin:
         tab_list.append("עריכת יעדים (לקוח יחיד)")
 
     tabs = st.tabs(tab_list)
 
-    # --- טאב 1: דאשבורד ---
+    # --- טאב 1: דאשבורד (לכולם) ---
     with tabs[0]:
         st.header("לוח בקרה")
-        if not df.empty:
-            st.write(f"סה''כ שורות במערכת: {len(df)}")
-        else:
-            st.write("אין נתונים להצגה.")
+        st.write("נתונים כלליים...")
 
-    # --- טאב 2: צפייה בנתונים (כאן ביצעתי את תיקון הסינון) ---
+    # --- טאב 2: צפייה בנתונים (לכולם) ---
     with tabs[1]:
         st.header("נתוני מכירות")
-        if not df.empty:
-            # סינון לפי קבוצת מיון
-            col_name = "קבוצת מיון" if "קבוצת מיון" in df.columns else df.columns[0]
-            categories = sorted(df[col_name].unique().tolist())
-            
-            selected_cat = st.selectbox("סנן לפי קבוצת מיון:", ["הצג הכל"] + categories)
-            
-            if selected_cat != "הצג הכל":
-                display_df = df[df[col_name] == selected_cat]
-            else:
-                display_df = df
-                
-            st.dataframe(display_df, use_container_width=True)
-        else:
-            st.info("כאן כולם רואים נתונים ב-View Only. כרגע אין נתונים.")
+        st.write("כאן כולם רואים נתונים ב-View Only.")
 
-    # --- טאב 3: עריכת יעדים (ADMIN בלבד - טעינה מחדש נקייה) ---
+    # --- טאב 3: עריכת יעדים (ADMIN בלבד) ---
     if is_admin:
         with tabs[2]:
-            st.header("🔧 ניהול נתונים")
+            st.header("🔧 עריכת יעדים (לקוח יחיד)")
+            st.info("ממשק זה זמין עבורך בלבד כמנהל.")
             
-            # אפשרות העלאת קובץ חדש (החלפה נקייה)
-            uploaded_file = st.file_uploader("העלה קובץ אקסל חדש (xlsx)", type="xlsx")
-            if st.button("עדכן נתונים ודרוס קודמים"):
-                if uploaded_file:
-                    new_df = pd.read_excel(uploaded_file)
-                    with get_connection() as conn:
-                        # שימוש ב-replace מבטיח שהנתונים הישנים נמחקים
-                        new_df.to_sql("sales_targets", conn, if_exists="replace", index=False)
-                    st.success("הנתונים עודכנו בהצלחה!")
-                    st.rerun()
+            # כאן תבוא הטבלה שרק המנהל יכול לראות ולערוך
+            # לדוגמה:
+            # df_targets = load_data_from_sqlite()
+            # edited_df = st.data_editor(df_targets)
+            # save_to_sqlite(edited_df)
             
-            st.write("---")
-            st.write("טבלת עריכה ידנית:")
-            if not df.empty:
-                edited_df = st.data_editor(df)
-                if st.button("שמור שינויים בטבלה"):
-                    with get_connection() as conn:
-                        edited_df.to_sql("sales_targets", conn, if_exists="replace", index=False)
-                    st.success("השינויים נשמרו!")
+            st.write("טבלת עריכה מוצגת כאן...")
 
 if __name__ == "__main__":
     main()
